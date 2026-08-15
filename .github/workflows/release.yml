@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: miuread-stable-release
+  group: soweread-stable-release
   cancel-in-progress: false
 
 jobs:
@@ -33,19 +33,19 @@ jobs:
           set -euo pipefail
 
           test "${GITHUB_REF_TYPE:-}" = "tag"
-          test -d miuread.koplugin
-          test -f miuread.koplugin/main.lua
-          test -f miuread.koplugin/_meta.lua
-          test -f miuread.koplugin/miuread/config.lua
+          test -d soweread.koplugin
+          test -f soweread.koplugin/main.lua
+          test -f soweread.koplugin/_meta.lua
+          test -f soweread.koplugin/soweread/config.lua
           test -s CHANGELOG.md
           test -s LICENSE
           test -s NOTICE
           test -s THIRD_PARTY_NOTICES
-          test -s miuread.koplugin/LICENSE
-          test -s miuread.koplugin/NOTICE
-          test -s miuread.koplugin/THIRD_PARTY_NOTICES
+          test -s soweread.koplugin/LICENSE
+          test -s soweread.koplugin/NOTICE
+          test -s soweread.koplugin/THIRD_PARTY_NOTICES
           grep -Fq 'GNU AFFERO GENERAL PUBLIC LICENSE' LICENSE
-          grep -Fq '许可证：AGPL-3.0-only。' miuread.koplugin/main.lua
+          grep -Fq '许可证：AGPL-3.0-only。' soweread.koplugin/main.lua
 
           python3 - <<'PY'
           from pathlib import Path
@@ -60,8 +60,8 @@ jobs:
               sys.exit(1)
           version = match.group(1)
 
-          config = Path("miuread.koplugin/miuread/config.lua").read_text(encoding="utf-8")
-          meta = Path("miuread.koplugin/_meta.lua").read_text(encoding="utf-8")
+          config = Path("soweread.koplugin/soweread/config.lua").read_text(encoding="utf-8")
+          meta = Path("soweread.koplugin/_meta.lua").read_text(encoding="utf-8")
           version_pattern = r"[0-9]+\.[0-9]+\.[0-9]+"
           config_version = re.search(
               r'\bVERSION\s*=\s*["\'](' + version_pattern + r')["\']', config
@@ -81,7 +81,7 @@ jobs:
 
           channel = re.search(r'\bUPDATE_CHANNEL\s*=\s*["\']([^"\']+)["\']', config)
           label = re.search(r'\bUPDATE_CHANNEL_LABEL\s*=\s*["\']([^"\']+)["\']', config)
-          if not channel or channel.group(1) != "stable":
+          if not channel or channel.group(1) != "soweread-stable":
               print("::error::插件不是正式通道。")
               sys.exit(1)
           if not label or label.group(1) != "正式通道":
@@ -89,7 +89,7 @@ jobs:
               sys.exit(1)
 
           expected_manifest = (
-              "https://github.com/miumiupy98-art/miuread-koreader/"
+              "https://github.com/windgeek/soweread-koreader/"
               "releases/download/stable-channel/update.json"
           )
           manifest = re.search(r'\bUPDATE_MANIFEST\s*=\s*["\']([^"\']+)["\']', config)
@@ -155,19 +155,19 @@ jobs:
           Path("release.env").write_text(
               f"VERSION={version}\n"
               f"RELEASE_TAG={tag}\n"
-              f"PACKAGE_NAME=miuread-v{version}-full.zip\n",
+              f"PACKAGE_NAME=soweread-v{version}-full.zip\n",
               encoding="utf-8",
           )
           PY
 
           cat release.env >> "$GITHUB_ENV"
 
-          if find miuread.koplugin -type f \( \
+          if find soweread.koplugin -type f \( \
               -iname '*.md' -o \
               -iname '*.epub' -o \
               -iname '*.log' -o \
               -name '.DS_Store' -o \
-              -name 'miuread.lua' -o \
+              -name 'soweread.lua' -o \
               -name 'settings.reader.lua' \
           \) | grep -q .; then
             echo "::error::插件目录包含不应发布的文件。"
@@ -180,7 +180,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y lua5.1
-          find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
+          find soweread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
 
       - name: Build stable full package and manifest
         shell: bash
@@ -198,13 +198,13 @@ jobs:
           version = os.environ["VERSION"]
           package_name = os.environ["PACKAGE_NAME"]
           repo = os.environ["GITHUB_REPOSITORY"]
-          root = Path("miuread.koplugin")
+          root = Path("soweread.koplugin")
           output = Path("dist") / package_name
           fixed_time = (2020, 1, 1, 0, 0, 0)
 
           excluded_names = {
               ".DS_Store",
-              "miuread.lua",
+              "soweread.lua",
               "settings.reader.lua",
               "NON_COMMERCIAL_NOTICE.txt",
           }
@@ -247,8 +247,8 @@ jobs:
           summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
           manifest = {
               "version": version,
-              "name": f"觅阅 · 微信读书助手 {version}",
-              "channel": "stable",
+              "name": f"轻松读 · 微信读书助手 {version}",
+              "channel": "soweread-stable",
               "package_type": "full",
               "package_url": official,
               "package_urls": [
@@ -286,14 +286,14 @@ jobs:
           manifest = json.loads(Path("dist/update.json").read_text(encoding="utf-8"))
           summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
           required = {
-              "miuread.koplugin/_meta.lua",
-              "miuread.koplugin/main.lua",
-              "miuread.koplugin/miuread/config.lua",
-              "miuread.koplugin/LICENSE",
-              "miuread.koplugin/NOTICE",
-              "miuread.koplugin/THIRD_PARTY_NOTICES",
+              "soweread.koplugin/_meta.lua",
+              "soweread.koplugin/main.lua",
+              "soweread.koplugin/soweread/config.lua",
+              "soweread.koplugin/LICENSE",
+              "soweread.koplugin/NOTICE",
+              "soweread.koplugin/THIRD_PARTY_NOTICES",
           }
-          forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
+          forbidden_names = {".DS_Store", "soweread.lua", "settings.reader.lua"}
           forbidden_suffixes = {".md", ".epub", ".log"}
 
           with ZipFile(package) as archive:
@@ -307,7 +307,7 @@ jobs:
               errors.append(f"安装包缺少：{name}")
           for name in names:
               path = Path(name)
-              if not name.startswith("miuread.koplugin/"):
+              if not name.startswith("soweread.koplugin/"):
                   errors.append(f"安装包根目录错误：{name}")
               if (
                   path.name in forbidden_names
@@ -317,7 +317,7 @@ jobs:
                   errors.append(f"不应进入安装包：{name}")
           if manifest.get("version") != os.environ["VERSION"]:
               errors.append("更新清单版本错误")
-          if manifest.get("channel") != "stable":
+          if manifest.get("channel") != "soweread-stable":
               errors.append("更新清单通道错误")
           if manifest.get("notes") != summary or manifest.get("summary") != summary:
               errors.append("线上更新摘要错误")
@@ -349,13 +349,13 @@ jobs:
             gh release delete-asset "$RELEASE_TAG" "$PACKAGE_NAME" --yes >/dev/null 2>&1 || true
             gh release upload "$RELEASE_TAG" "$FILE"
             gh release edit "$RELEASE_TAG" \
-              --title "觅阅 · 微信读书助手 $VERSION" \
+              --title "轻松读 · 微信读书助手 $VERSION" \
               --notes-file "$NOTES_FILE" \
               --latest
           else
             gh release create "$RELEASE_TAG" "$FILE" \
               --verify-tag \
-              --title "觅阅 · 微信读书助手 $VERSION" \
+              --title "轻松读 · 微信读书助手 $VERSION" \
               --notes-file "$NOTES_FILE" \
               --latest
           fi
@@ -403,14 +403,14 @@ jobs:
             gh release delete-asset "$CHANNEL_TAG" "$MANIFEST_NAME" --yes >/dev/null 2>&1 || true
             gh release upload "$CHANNEL_TAG" "dist/$MANIFEST_NAME"
             gh release edit "$CHANNEL_TAG" \
-              --title "MiuRead Stable Update Channel" \
-              --notes "Machine-readable update manifest for MiuRead Stable. Do not install this release directly." \
+              --title "SoweRead Stable Update Channel" \
+              --notes "Machine-readable update manifest for SoweRead Stable. Do not install this release directly." \
               --latest=false
           else
             gh release create "$CHANNEL_TAG" "dist/$MANIFEST_NAME" \
               --target "$GITHUB_SHA" \
-              --title "MiuRead Stable Update Channel" \
-              --notes "Machine-readable update manifest for MiuRead Stable. Do not install this release directly." \
+              --title "SoweRead Stable Update Channel" \
+              --notes "Machine-readable update manifest for SoweRead Stable. Do not install this release directly." \
               --latest=false
           fi
 
@@ -430,36 +430,5 @@ jobs:
           if [ "$success" != "1" ]; then
             echo "::error::固定正式更新清单尚不可用或内容校验失败。"
             exit 1
-          fi
-      - name: Publish 4.3.0 legacy OTA bridge
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          if [ "$VERSION" != "4.3.0" ]; then
-            echo "Legacy main/update.json bridge is frozen at v4.3.0; skip."
-            exit 0
-          fi
-
-          # 4.1.2 and older stable builds only know main/update.json.
-          # Freeze that legacy entry at 4.3.0 so they cross once into the new
-          # stable-channel OTA generation; later releases do not rewrite it.
-          CONTENT="$(base64 -w 0 dist/update.json)"
-          API_PATH="repos/$GITHUB_REPOSITORY/contents/update.json"
-          CURRENT_SHA="$(gh api "$API_PATH?ref=main" --jq '.sha' 2>/dev/null || true)"
-
-          if [ -n "$CURRENT_SHA" ]; then
-            gh api --method PUT "$API_PATH" \
-              -f message="Bridge legacy OTA to v4.3.0" \
-              -f content="$CONTENT" \
-              -f branch="main" \
-              -f sha="$CURRENT_SHA" >/dev/null
-          else
-            gh api --method PUT "$API_PATH" \
-              -f message="Add legacy OTA bridge for v4.3.0" \
-              -f content="$CONTENT" \
-              -f branch="main" >/dev/null
           fi
 
