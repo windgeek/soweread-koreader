@@ -1,5 +1,5 @@
 local U = require("soweread.util")
-local PosMap = require("soweread.annotations.posmap")
+local PosMap = require("soweread.textmap.posmap")
 local WRCo = require("soweread.wr_co")
 
 local M = {}

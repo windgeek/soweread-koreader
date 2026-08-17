@@ -10,7 +10,7 @@ The caller should pass the same complete raw XHTML map used by annotation
 coordinates (UTF-8 BOM removed, no body cropping or whitespace normalization).
 --]]--
 
-local PosMap = require("soweread.annotations.posmap")
+local PosMap = require("soweread.textmap.posmap")
 
 local M = {}
 

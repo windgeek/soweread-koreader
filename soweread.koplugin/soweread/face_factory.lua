@@ -1,4 +1,4 @@
--- Native thought-popup font construction and per-glyph fallback support.
+-- Font-face construction and per-glyph fallback support for widget text rendering.
 -- The module prefers the selected/document font, then adds KOReader symbol,
 -- CJK and optional monochrome Emoji faces. All failures fall back to KOReader's
 -- normal Font:getFace path so a missing font can never block the popup.
@@ -77,7 +77,7 @@ function FaceFactory:findEmojiFont()
         local resolved = realpath(path)
         if resolved then
             self.emoji_path = resolved
-            logger.info("[SoweRead][ThoughtPopup] emoji fallback font:", resolved)
+            logger.info("[SoweRead][FaceFactory] emoji fallback font:", resolved)
             return resolved
         end
     end
@@ -145,7 +145,7 @@ function FaceFactory:_buildFace(path, size, scale_size)
 
     local ok, ftsize = pcall(Freetype.newFaceSize, path, scaled_size)
     if not ok or not ftsize then
-        logger.warn("[SoweRead][ThoughtPopup] unable to open fallback font:", tostring(path))
+        logger.warn("[SoweRead][FaceFactory] unable to open fallback font:", tostring(path))
         return nil
     end
 

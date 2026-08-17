@@ -5,7 +5,6 @@ local AnnotationCoord = require("soweread.annotation_coord")
 local Footnotes = require("soweread.footnotes")
 local ResourceRefs = require("soweread.resource_refs")
 local InternalLinks = require("soweread.internal_links")
-local Thoughts = require("soweread.thoughts")
 local Epub = require("soweread.epub")
 local Http = require("soweread.http")
 local DownloadPlan = require("soweread.download_plan")
@@ -1174,140 +1173,6 @@ function Downloader:book(input, opt, progress)
     local function chapter_uid(chapter)
         return tostring(chapter and (chapter.chapterUid or chapter.uid) or "")
     end
-    local function record_annotation_error(chapter,annotation)
-        local uid=chapter_uid(chapter)
-        local message=table.concat(annotation and annotation.errors or {},"; ")
-        if message=="" then message="批注数据尚未完整" end
-        annotation_error_map[uid]={uid=uid,title=chapter and chapter.title,error=message,
-            error_kind=annotation and annotation.error_kind or "incomplete"}
-        annotation_error_kind=annotation_error_kind or (annotation and annotation.error_kind) or "incomplete"
-    end
-
-    local function fetch_annotation(chapter,report_progress)
-        local uid=chapter_uid(chapter)
-        local previous=DownloadDatabase.load_annotation_data(cache.root,uid,annotation_account_key,self.annotations)
-        if annotation_suspended then
-            local cached=previous or self.annotations:from_cache({book_id=book.bookId,chapter_uid=uid})
-            cached.complete=false
-            cached.review_complete=false
-            cached.error_kind=annotation_error_kind or "deferred"
-            cached.errors=cached.errors or {}
-            if #cached.errors==0 then
-                if cached.error_kind=="rate_limit" then
-                    cached.errors[#cached.errors+1]="划线和想法请求暂时受限，正文继续下载，稍后可从断点补全"
-                elseif cached.error_kind=="forbidden" then
-                    cached.errors[#cached.errors+1]="划线和想法接口暂时不可用，正文继续下载"
-                else
-                    cached.errors[#cached.errors+1]="划线和想法暂未补全，正文继续下载"
-                end
-            end
-            return cached
-        end
-
-        local function persist_checkpoint(snapshot)
-            local merged=self.annotations:merge(previous,snapshot)
-            merged.saved_at=os.time()
-            local saved,save_error=DownloadDatabase.save_annotation_data(cache.root,uid,annotation_account_key,self.annotations,merged)
-            if not saved then error("无法保存批注断点："..tostring(save_error)) end
-            previous=DownloadDatabase.load_annotation_data(cache.root,uid,annotation_account_key,self.annotations) or merged
-            -- Keep the compact per-download checkpoint after every successful
-            -- batch, but update the shared popup cache only once when the
-            -- chapter finishes. This avoids dozens of redundant Kindle writes.
-            return previous
-        end
-
-        local function fetch_once()
-            return self.annotations:fetch_chapter(book.bookId,chapter.chapterUid or chapter.uid,
-                function(stage,current_index,total)
-                    respect_reader_priority("annotation_batch")
-                    if report_progress then report_progress(stage,current_index,total) end
-                end,
-                {previous=previous,checkpoint=persist_checkpoint})
-        end
-
-        local ok,current=pcall(fetch_once)
-        if not ok or type(current)~="table" then
-            current={book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
-                underline_count=0,thought_count=0,thought_entry_count=0,underline_request_ok=false,
-                review_complete=false,complete=false,error_kind="server",errors={tostring(current)}}
-        end
-
-        if (current.auth_required==true or current.forbidden==true) and not annotation_recovery_attempted
-            and self.reader and type(self.reader._recover_login_session)=="function" then
-            annotation_recovery_attempted=true
-            local recovered,recover_error=self.reader:_recover_login_session()
-            logger.info("[SoweRead][Download] annotation login renewal attempted",
-                "renewed=",tostring(recovered),"book=",tostring(book.bookId),
-                "error=",recovered and "" or tostring(recover_error))
-            if recovered then
-                local retry_ok,retry_annotation=pcall(fetch_once)
-                if retry_ok and type(retry_annotation)=="table" then
-                    current=retry_annotation
-                    if current.complete==true or (current.auth_required~=true and current.forbidden~=true) then
-                        logger.info("[SoweRead][Download] annotation access restored after renewal",
-                            "book=",tostring(book.bookId),"chapter=",uid)
-                    else
-                        logger.warn("[SoweRead][Download] annotation access still unavailable after renewal",
-                            "book=",tostring(book.bookId),"chapter=",uid,
-                            "kind=",tostring(current.error_kind or "incomplete"))
-                    end
-                else
-                    current.errors=current.errors or {}
-                    current.errors[#current.errors+1]=tostring(retry_annotation)
-                    logger.warn("[SoweRead][Download] annotation endpoint retry failed after renewal",
-                        "book=",tostring(book.bookId),"chapter=",uid,
-                        "error=",tostring(retry_annotation))
-                end
-            else
-                current.errors=current.errors or {}
-                current.errors[#current.errors+1]="自动续期失败："..tostring(recover_error)
-            end
-        end
-
-        local merged
-        if current==previous then
-            merged=current
-        else
-            merged=self.annotations:merge(previous,current)
-        end
-        merged.saved_at=os.time()
-        local saved,save_error=DownloadDatabase.save_annotation_data(cache.root,uid,annotation_account_key,self.annotations,merged)
-        if not saved then error("无法保存批注断点："..tostring(save_error)) end
-
-        if current.auth_required==true then
-            error(table.concat(current.errors or {},"; ")~="" and table.concat(current.errors or {},"; ")
-                or "登录状态已失效 [SoweReadAuth]")
-        end
-        if current.rate_limited==true then
-            annotation_suspended=true
-            annotation_error_kind="rate_limit"
-            merged.complete=false
-            merged.review_complete=false
-            merged.rate_limited=true
-            merged.error_kind="rate_limit"
-            merged.errors=merged.errors or {}
-            if #merged.errors==0 then
-                merged.errors[#merged.errors+1]="划线和想法请求暂时受限，正文继续下载，稍后可从断点补全"
-            end
-            local resaved,resave_error=DownloadDatabase.save_annotation_data(
-                cache.root,uid,annotation_account_key,self.annotations,merged)
-            if not resaved then error("无法保存批注断点："..tostring(resave_error)) end
-            logger.warn("[SoweRead][Download] annotation rate limit deferred without stopping content",
-                "book=",tostring(book.bookId),"chapter=",uid)
-        end
-        if current.forbidden==true then
-            annotation_suspended=true
-            annotation_error_kind="forbidden"
-        elseif merged.complete~=true and tostring(current.error_kind or "")~="data" then
-            annotation_suspended=true
-            annotation_error_kind=current.error_kind or "incomplete"
-        end
-
-        if type(merged.review_groups)=="table" then
-            Thoughts.save(self.store,book.bookId,chapter.chapterUid or chapter.uid,merged.review_groups)
-        end
-        return merged
-    end
 
     local function mark_failure(chapter, message)
         local uid = tostring(chapter.chapterUid or chapter.uid)
@@ -1587,36 +1452,6 @@ function Downloader:book(input, opt, progress)
         end
 
         local annotation
-        if requested_annotations then
-            progress("underlines",index,expected,chapter.title)
-            annotation=fetch_annotation(chapter,function(stage,current_index,total)
-                progress(stage,index,expected,chapter.title,{batch=current_index,batches=total})
-            end)
-            local pending=annotation.complete~=true
-            entry.annotation_done=not pending
-            entry.annotation_pending=pending or nil
-            entry.annotation_error_kind=pending and (annotation.error_kind or "incomplete") or nil
-            entry.annotation_error=pending and table.concat(annotation.errors or {},"; ") or nil
-            entry.annotation_account_key=annotation_account_key
-            entry.annotation_run_id=opt.download_run_id
-            if pending then
-                record_annotation_error(chapter,annotation)
-                logger.warn("[SoweRead][Download] annotations preserved with pending items",
-                    "book=",tostring(book.bookId),"chapter=",uid,
-                    "kind=",tostring(annotation.error_kind or "incomplete"))
-            else
-                annotation_error_map[uid]=nil
-            end
-            local extra_css,apply_stats
-            body,extra_css,apply_stats=self.annotations:apply(body,annotation,coord_body)
-            entry.annotation_fallback=tonumber(apply_stats and apply_stats.fallback or 0) or 0
-            entry.annotation_official=tonumber(apply_stats and apply_stats.official or 0) or 0
-            entry.annotation_official_verified=tonumber(apply_stats and apply_stats.official_verified or 0) or 0
-            entry.annotation_official_roundtrip=tonumber(apply_stats and apply_stats.official_roundtrip or 0) or 0
-            entry.annotation_official_failed=tonumber(apply_stats and apply_stats.official_failed or 0) or 0
-            style=tostring(style or "").."\n"..tostring(extra_css or "")
-            cache_save(cache)
-        end
 
         entry = finalize_chapter(chapter,index,entry,body,style,annotation)
         local final_path, final_error = cache_load_final_source(cache, entry)

@@ -1,7 +1,6 @@
 local Digests=require("soweread.digests")
 local EpubInstaller=require("soweread.epub_installer")
 local DownloadDatabase=require("soweread.download_database")
-local DownloadResult=require("soweread.download_result")
 local U=require("soweread.util")
 
 local M={}
@@ -191,7 +190,6 @@ end
 local function partial_manifest_pending(manifest, has_record)
     if type(manifest)~="table" then return false end
     if manifest.final_repair_required==true then return true end
-    if DownloadResult.annotation_pending(manifest) then return true end
     for _,entry in pairs(type(manifest.chapters)=="table" and manifest.chapters or {}) do
         if type(entry)=="table" and (entry.complete~=true or tostring(entry.error or "")~="") then return true end
     end
@@ -238,9 +236,6 @@ function M.inspect(store,book_id,record)
         book_id=book_id,
         file_ok=false,
         core_map_valid=false,
-        annotation_pending=DownloadResult.annotation_pending(record),
-        annotation_unresolved=DownloadResult.annotation_unresolved(record),
-        annotation_error_kind=type(record)=="table" and record.annotation_error_kind or nil,
         repair_kind="none",
     }
     if type(record)~="table" then
@@ -279,11 +274,7 @@ function M.inspect(store,book_id,record)
     local hash=M.core_map_hash(book_id,full_map,local_map)
     out.core_map_hash=hash
     out.core_map_valid=hash~="" and #local_map>0 and #full_map>0
-    out.annotation_pending=out.annotation_pending or DownloadResult.annotation_pending(meta)
-    out.annotation_unresolved=out.annotation_unresolved or DownloadResult.annotation_unresolved(meta)
-    if out.annotation_pending then
-        out.repair_kind="annotations"
-    elseif not out.core_map_valid then
+    if not out.core_map_valid then
         out.repair_kind="content"
         out.error="章节映射不完整"
     else

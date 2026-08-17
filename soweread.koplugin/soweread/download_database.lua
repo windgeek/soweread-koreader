@@ -54,21 +54,6 @@ function DownloadDatabase.delete_assets(root, chapter_uid)
     return SQLiteStore.delete_path(partial_path(root), "assets:" .. safe_id(chapter_uid))
 end
 
-function DownloadDatabase.save_annotation(root, chapter_uid, account_key, snapshot)
-    local key = "annotation:" .. safe_id(chapter_uid) .. ":" .. safe_id(account_key)
-    return SQLiteStore.set_json_path(partial_path(root), key, snapshot)
-end
-
-function DownloadDatabase.load_annotation(root, chapter_uid, account_key)
-    local key = "annotation:" .. safe_id(chapter_uid) .. ":" .. safe_id(account_key)
-    return SQLiteStore.get_json_path(partial_path(root), key, nil, true)
-end
-
-function DownloadDatabase.delete_annotation(root, chapter_uid, account_key)
-    local key = "annotation:" .. safe_id(chapter_uid) .. ":" .. safe_id(account_key)
-    return SQLiteStore.delete_path(partial_path(root), key)
-end
-
 function DownloadDatabase.set_download_state(store, value)
     return SQLiteStore.set_json_path(runtime_path(store), "download_state", value or {})
 end
@@ -173,7 +158,7 @@ function DownloadDatabase.migrate_legacy_partial(root)
         manifest_saved = true
     end
 
-    local migrated_assets, migrated_annotations, remaining = 0, 0, 0
+    local migrated_assets, remaining = 0, 0
     for uid in pairs(type(manifest.chapters) == "table" and manifest.chapters or {}) do
         local chapter_dir = tostring(root) .. "/chapters/" .. U.id_name(uid)
         local assets_path = chapter_dir .. "/assets.json"
@@ -187,33 +172,12 @@ function DownloadDatabase.migrate_legacy_partial(root)
                 remaining = remaining + 1
             end
         end
-        local annotation_dir = chapter_dir .. "/annotations"
-        if lfs.attributes(annotation_dir, "mode") == "directory" then
-            for name in lfs.dir(annotation_dir) do
-                if name:match("%.json$") then
-                    local path = annotation_dir .. "/" .. name
-                    local snapshot = read_legacy_json(path)
-                    local account_key = name:gsub("%.json$", "")
-                    if type(snapshot) == "table" then
-                        local ok_annotation = DownloadDatabase.save_annotation(root, uid, account_key, snapshot)
-                        if ok_annotation then
-                            os.remove(path)
-                            migrated_annotations = migrated_annotations + 1
-                        else
-                            remaining = remaining + 1
-                        end
-                    else
-                        remaining = remaining + 1
-                    end
-                end
-            end
-        end
     end
     if manifest_saved then os.remove(manifest_path) end
     return {
-        migrated=type(legacy_manifest) == "table" or migrated_assets > 0 or migrated_annotations > 0,
+        migrated=type(legacy_manifest) == "table" or migrated_assets > 0,
         existing=type(existing_manifest) == "table",
-        assets=migrated_assets, annotations=migrated_annotations, remaining=remaining,
+        assets=migrated_assets, remaining=remaining,
     }
 end
 

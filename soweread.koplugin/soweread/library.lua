@@ -1,7 +1,6 @@
 local Protocol=require("soweread.protocol")
 local Codec=require("soweread.codec")
 local U=require("soweread.util")
-local DownloadResult=require("soweread.download_result")
 local logger=require("logger")
 local Library={}; Library.__index=Library
 function Library:new(api,http,store)
@@ -197,8 +196,8 @@ end
 
 function Library:normalize(data)
     data=type(data)=="table" and data or {}
-    local books,mp={},{}
-    local seen_books,seen_mp={},{}
+    local books={}
+    local seen_books={}
     local archive_map=build_archive_map(data)
     local src=data.books or data.bookList or data.updated or {}
     if type(src)~="table" then src={} end
@@ -207,32 +206,16 @@ function Library:normalize(data)
         raw_index=raw_index+1
         local b=book(r,raw_index,archive_map)
         if b.bookId~="" then
-            if Protocol.is_mp_account(b.bookId) then
-                if not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
-            elseif not Protocol.is_mp(b.bookId) and not seen_books[b.bookId] then
+            if not Protocol.is_mp_account(b.bookId) and not Protocol.is_mp(b.bookId) and not seen_books[b.bookId] then
                 books[#books+1]=b; seen_books[b.bookId]=true
             end
         end
     end
-    local extras={data.mp,data.mpBook,data.officialAccounts}
-    for _,x in ipairs(extras) do
-        if type(x)=="table" then
-            if x[1] then
-                for _,r in ipairs(x) do
-                    raw_index=raw_index+1
-                    local b=book(r,raw_index,archive_map)
-                    if Protocol.is_mp_account(b.bookId) and not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
-                end
-            else
-                raw_index=raw_index+1
-                local b=book(x,raw_index,archive_map)
-                if Protocol.is_mp_account(b.bookId) and not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
-            end
-        end
-    end
     order_cloud_rows(books)
-    order_cloud_rows(mp)
-    return books,mp
+    -- mp is always empty: MP/official-account reading was removed. The second
+    -- return value is kept so every existing (books, mp[, updated_at])
+    -- call site in main.lua keeps working without a signature-wide audit.
+    return books,{}
 end
 
 function Library:refresh(options)
@@ -251,9 +234,6 @@ local function record_state(row)
     local filenames={}
     local total_size=0
     local has_clean=false
-    local has_notes=false
-    local annotation_pending=false
-    local annotation_fallback=false
     local content_type=nil
     local function scan(record,kind,is_final)
         if type(record)~="table" then return end
@@ -268,11 +248,6 @@ local function record_state(row)
                     total_size=total_size+(tonumber(U.file_size(file)) or 0)
                     content_type=record.content_type or content_type
                     if kind=="clean" or kind=="range_clean" or kind=="preview_clean" then has_clean=true end
-                    if kind=="notes" or kind=="range_notes" or kind=="preview_notes" then
-                        has_notes=true
-                        if DownloadResult.annotation_pending(record) then annotation_pending=true end
-                        if record.annotation_fallback==true then annotation_fallback=true end
-                    end
                 else
                     partial_downloaded=true
                 end
@@ -292,9 +267,6 @@ local function record_state(row)
         filenames=table.concat(filenames," "),
         file_size=total_size,
         has_clean=has_clean,
-        has_notes=has_notes,
-        annotation_pending=annotation_pending,
-        annotation_fallback=annotation_fallback,
         content_type=content_type,
     }
 end
@@ -314,7 +286,7 @@ end
 function Library:local_books(library_snapshot,sessions_snapshot)
     local source=library_snapshot or self.store:library()
     local sessions=sessions_snapshot or self.store:get("sessions",{})
-    local books,mp={},{}
+    local books={}
     for id,row in pairs(source or {}) do
         local state=record_state(row)
         if state.downloaded then
@@ -335,23 +307,18 @@ function Library:local_books(library_snapshot,sessions_snapshot)
                 filename_search=state.filenames,
                 fileSize=state.file_size,
                 hasClean=state.has_clean,
-                hasNotes=state.has_notes,
-                annotation_pending=state.annotation_pending,
-                annotation_fallback=state.annotation_fallback,
                 access=U.copy(row.access or {}),
                 content_type=state.content_type or row.content_type,
                 local_record=row,
             }
-            if b.bookId~="" then
-                if Protocol.is_mp_account(b.bookId) then
-                    mp[#mp+1]=b
-                elseif not Protocol.is_mp(b.bookId) then
-                    books[#books+1]=b
-                end
+            if b.bookId~="" and not Protocol.is_mp_account(b.bookId) and not Protocol.is_mp(b.bookId) then
+                books[#books+1]=b
             end
         end
     end
-    return books,mp
+    -- mp is always empty: MP/official-account reading was removed. Kept as a
+    -- second return value so every existing (books, mp) call site still works.
+    return books,{}
 end
 
 local function local_index(local_rows)
@@ -374,9 +341,6 @@ local function merge_local_metadata(remote,local_book)
     remote.filename_search=local_book.filename_search
     remote.fileSize=tonumber(local_book.fileSize or 0) or 0
     remote.hasClean=local_book.hasClean==true
-    remote.hasNotes=local_book.hasNotes==true
-    remote.annotation_pending=local_book.annotation_pending==true
-    remote.annotation_fallback=local_book.annotation_fallback==true
     remote.access=U.copy(local_book.access or {})
     remote.content_type=remote.content_type or local_book.content_type
     remote.local_record=local_book.local_record

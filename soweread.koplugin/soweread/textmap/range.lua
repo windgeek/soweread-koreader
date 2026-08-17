@@ -16,7 +16,7 @@
   for i = start, end_pos - 1 do ... end
   runes[1] ↔ 服务端偏移 0
 
-@module soweread.annotations.range
+@module soweread.textmap.range
 --]]--
 
 local util = require("util")

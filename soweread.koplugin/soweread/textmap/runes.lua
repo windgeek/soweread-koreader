@@ -9,7 +9,7 @@ BOM：章节 HTML 读入时通常不含 BOM。注入前剥 BOM，避免整章右
 
 Lua 数组 1-index：runes[1] ↔ 服务端偏移 0。
 
-@module soweread.annotations.runes
+@module soweread.textmap.runes
 --]]--
 
 local util = require("util")

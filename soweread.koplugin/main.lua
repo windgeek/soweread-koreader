@@ -26,15 +26,10 @@ local Api=require("soweread.api")
 local Auth=require("soweread.auth")
 local Reader=require("soweread.reader")
 local Protocol=require("soweread.protocol")
-local MP=require("soweread.mp")
 local Access=require("soweread.access")
-local Annotations=require("soweread.annotations")
-local LocalAnnotationDatabase=require("soweread.local_annotation_database")
-local AnnotationSync=require("soweread.annotation_sync")
 local Downloader=require("soweread.downloader")
 local DownloadProgress=require("soweread.download_progress")
 local DownloadTask=require("soweread.download_task")
-local DownloadResult=require("soweread.download_result")
 local BookIntegrity=require("soweread.book_integrity")
 local EpubInstaller=require("soweread.epub_installer")
 local CacheCleanupTask=require("soweread.cache_cleanup_task")
@@ -61,8 +56,6 @@ local Async=require("soweread.async")
 local Sync=require("soweread.sync")
 local Updater=require("soweread.updater")
 local Cookies=require("soweread.cookies")
-local Thoughts=require("soweread.thoughts")
-local ThoughtNativePopup=require("soweread.thought_native_popup")
 local ReaderToolbar=require("soweread.reader_toolbar")
 local ReaderListDialog=require("soweread.reader_list_dialog")
 local ReaderControlCenter=require("soweread.reader_control_center")
@@ -71,7 +64,6 @@ local ReaderSettingsDialog=require("soweread.reader_settings_dialog")
 local ReaderTypographyDialog=require("soweread.reader_typography_dialog")
 local ReaderTocDialog=require("soweread.reader_toc_dialog")
 local ReaderFrontlightDialog=require("soweread.reader_frontlight_dialog")
-local DataMigration=require("soweread.data_migration")
 local MigrationProgress=require("soweread.migration_progress")
 local DownloadDatabase=require("soweread.download_database")
 local StatusToast=require("soweread.status_toast")
@@ -94,6 +86,65 @@ local Menu=gesture_aware_class(RawMenu,{_soweread_transient=true,_soweread_modal
 local PathChooser=gesture_aware_class(RawPathChooser,{_soweread_transient=true,_soweread_modal_surface=true})
 local _=Text.tr
 local unpack_args=unpack or table.unpack
+
+-- Minimal replacement for the deleted soweread/download_result.lua. Shelf and
+-- download-status display code still needs "is this file complete / pending
+-- install" labels; annotation-variant downloads no longer exist, so the
+-- annotation-specific branches below are permanently inert (record.annotation_pending
+-- is never set true anymore) but are kept verbatim rather than special-cased,
+-- since these are pure functions with no dependency on the deleted module's
+-- callers and rewriting call sites individually would be far riskier.
+local DownloadResult={}
+local function download_result_annotation_kind(record)
+    if type(record)~="table" then return "" end
+    return tostring(record.annotation_error_kind or ((record.annotation_summary or {}).error_kind) or "")
+end
+function DownloadResult.annotation_unresolved(record)
+    if type(record)~="table" or record.annotation_pending~=true then return false end
+    local kind=download_result_annotation_kind(record)
+    return kind=="data" or kind=="forbidden" or kind=="unrecoverable"
+end
+function DownloadResult.annotation_pending(record)
+    return type(record)=="table" and record.annotation_pending==true and not DownloadResult.annotation_unresolved(record)
+end
+function DownloadResult.annotation_fallback(record)
+    return type(record)=="table" and record.annotation_fallback==true
+end
+function DownloadResult.variant_label(label,record) return tostring(label or "") end
+function DownloadResult.aggregate(records)
+    local result={annotation_pending=false,annotation_fallback=false,annotation_unresolved=false}
+    for _,record in ipairs(records or {}) do
+        if DownloadResult.annotation_pending(record) then result.annotation_pending=true end
+        if DownloadResult.annotation_fallback(record) then result.annotation_fallback=true end
+        if DownloadResult.annotation_unresolved(record) then result.annotation_unresolved=true end
+    end
+    return result
+end
+function DownloadResult.state(record,pending_install)
+    if pending_install==true then return "pending_install" end
+    if DownloadResult.annotation_pending(record) then return "annotation_pending" end
+    return "completed"
+end
+function DownloadResult.shelf_status(record,pending_install)
+    if pending_install==true then return "等待关闭后更新" end
+    if DownloadResult.annotation_pending(record) then return "批注待修复" end
+    return "已生成"
+end
+function DownloadResult.notice(title,record,pending_install)
+    title=tostring(title or "未命名")
+    if pending_install==true then return title.."新版本已下载，关闭当前书籍后更新" end
+    if DownloadResult.annotation_pending(record) then return title.."正文下载完成，划线与想法待修复" end
+    return title.."下载完成"
+end
+function DownloadResult.summary_note(record)
+    if DownloadResult.annotation_pending(record) then
+        return "正文已生成；划线与想法暂未完整，可使用检查与修复补全。"
+    end
+    if DownloadResult.annotation_unresolved(record) then
+        return "正文与书籍文件完整；少量旧批注无法可靠恢复，已保留现状且不会反复要求修复。"
+    end
+    return nil
+end
 local SHELF_CACHE_TTL=15*60
 local SHELF_DIRECT_CACHE_TTL=6*60*60
 local COVER_GUARD_WINDOW=6*60*60
@@ -530,22 +581,13 @@ function Plugin:init()
     self._reader_interaction_resume_generation=0
     self._performance_prompt_pending=nil
     self._performance_prompt_dialog=nil
-    self.book_repair=DataMigration:new(self.store)
     logger.info("[SoweRead] initialized", "version=", tostring(Config.VERSION),
         "schema=", tostring(Config.SCHEMA), "root=", tostring(ROOT))
     sanitize_saved_auth(self.store)
     self.http=Http:new(self.store)
     self.reader=Reader:new(self.http,self.store)
     self.api=Api:new(self.http,self.store,self.reader)
-    self.mp=MP:new(self.reader,self.http,self.store,self.api)
-    self.annotations=Annotations:new(self.api)
-    self.annotation_sync=AnnotationSync:new(self.api,self.reader,self.store)
-    do
-        local annotation_prefs=self:_annotation_sync_preferences()
-        logger.info("[SoweRead][AnnotationSync] initialized",
-            "enabled=",tostring(annotation_prefs.enabled==true),"mode=manual")
-    end
-    self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http)
+    self.downloader=Downloader:new(self.reader,self.api,nil,self.store,self.http)
     self.download_task=DownloadTask:new(self.store)
     self.cache_cleanup_task=CacheCleanupTask:new(self.store)
     self.library=Library:new(self.api,self.http,self.store)
@@ -557,8 +599,6 @@ function Plugin:init()
     end
     self.access=Access:new(self.library,self.api,self.reader,self.store)
     self.async=Async:new(self.store,{allow_android=true,disable_fallback=true})
-    self.mp_async=Async:new(self.store,{poll_interval=.35,allow_android=true})
-    self.search_async=Async:new(self.store,{poll_interval=.4,allow_android=true})
     self.shelf_async=Async:new(self.store,{poll_interval=.4,allow_android=true})
     -- User-triggered network reads that used to run through UIManager must
     -- always stay off the UI thread. This worker is intentionally separate
@@ -1444,13 +1484,12 @@ function Plugin:home_menu()
     return out
 end
 
-function Plugin:_confirm_current_book_rebuild(book,annotations)
-    local label=annotations and "划线与想法版" or "纯净版"
+function Plugin:_confirm_current_book_rebuild(book)
     UIManager:show(ConfirmBox:new{
-        text="重新生成当前书籍的"..label.."？\n\n新文件会在生成完成后替换对应版本。",
+        text="重新生成当前书籍？\n\n新文件会在生成完成后替换对应版本。",
         ok_text="重新生成",
         cancel_text="取消",
-        ok_callback=function() self:choose_download_mode(book,{annotations=annotations},false) end,
+        ok_callback=function() self:choose_download_mode(book,{},false) end,
     })
 end
 
@@ -1469,8 +1508,7 @@ end
 
 function Plugin:current_book_rebuild_menu(book)
     return {
-        {text="重新生成纯净版",callback=function() self:_confirm_current_book_rebuild(book,false) end},
-        {text="重新生成划线与想法版",callback=function() self:_confirm_current_book_rebuild(book,true) end},
+        {text="重新生成",callback=function() self:_confirm_current_book_rebuild(book) end},
     }
 end
 
@@ -1486,47 +1524,8 @@ function Plugin:current_book_menu()
     }
 end
 
-function Plugin:current_mp_article_menu(mp_context)
-    local account={bookId=mp_context.bookId,title=mp_context.account_title or "公众号",author="公众号"}
-    local target
-    for _,article in ipairs(self.mp:cached_articles(mp_context.bookId) or {}) do
-        if tostring(article.reviewId or article.originalId or "")==tostring(mp_context.reviewId or "") then
-            target=article; break
-        end
-    end
-    if not target then return {{text="当前文章信息不可用",enabled=false}} end
-    local article=U.copy(target)
-    return {
-        {text="重新下载文章",callback=function() self:open_or_download_mp_article(account,article,true) end},
-        {text="删除本篇缓存",callback=function()
-            UIManager:show(ConfirmBox:new{text="删除《"..tostring(article.title or "文章").."》的本地缓存？",ok_callback=function()
-                local ok,err=self.mp:clear_article(account.bookId,article)
-                if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
-                self:status_toast("公众号","本篇缓存已删除",4)
-            end})
-        end},
-        {text="公众号缓存管理",sub_item_table_func=function() return self:mp_cache_menu(account,self.mp:cached_articles(account.bookId)) end},
-    }
-end
-
 function Plugin:reader_menu()
     self:maybe_auto_check_update(false)
-    local current_path=self:_current_document_path()
-    local mp_context=self.mp and self.mp:identify_path(current_path) or nil
-    if mp_context then
-        local desktop=self:_home_enabled()
-        local out={
-            {text="返回文章列表",callback=self:safe("mp-back",function() self:open_mp_account_by_id(mp_context.bookId,mp_context.account_title) end)},
-            {text="上一篇",callback=self:safe("mp-prev",function() self:open_mp_neighbor(-1) end)},
-            {text="下一篇",callback=self:safe("mp-next",function() self:open_mp_neighbor(1) end)},
-            {text="当前文章",sub_item_table_func=function() return self:current_mp_article_menu(mp_context) end},
-        }
-        if desktop then out[#out+1]={text="全部阅读功能",callback=function() self:show_reader_control_center("reading") end} end
-        out[#out+1]={text=self:_download_menu_text(),callback=function() self:show_downloads() end}
-        out[#out+1]={text="轻松读设置",sub_item_table_func=function() return self:settings_menu() end}
-        if not desktop then out[#out+1]={text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end} end
-        return out
-    end
     local desktop=self:_home_enabled()
     local out={
         {text=desktop and "退出阅读并返回轻松读主页" or "返回书架",callback=self:safe("shelf",function()
@@ -1887,7 +1886,6 @@ end
 function Plugin:_shelf_select(b)
     local id=tostring(b and (b.bookId or b.book_id) or "")
     if id=="" then return end
-    if Protocol.is_mp_account(id) then self:mp_account(b); return end
     local record=self:_preferred_record(id)
     if record and record.file and U.file_exists(record.file) then
         self:open_file(record.file)
@@ -1898,7 +1896,6 @@ end
 function Plugin:_shelf_hold(b)
     local id=tostring(b and (b.bookId or b.book_id) or "")
     if id=="" then return end
-    if Protocol.is_mp_account(id) then self:mp_account(b); return end
     self:book_menu(b)
 end
 
@@ -2113,159 +2110,6 @@ function Plugin:_shelf_tabs(selected)
     }
 end
 
-function Plugin:_refresh_mp_accounts(on_done,silent)
-    if not self:logged_in() then
-        if not silent then self.auth_flow:start() end
-        if on_done then on_done(nil,"尚未登录") end
-        return false
-    end
-    if not self:is_online() then
-        if on_done then on_done(nil,"网络不可用") end
-        if not silent then self:info(_("Network unavailable")) end
-        return false
-    end
-    if self.mp_async:busy() then
-        if on_done then on_done(nil,"另一项公众号任务正在进行中") end
-        if not silent then self:info("另一项公众号任务正在进行中。") end
-        return false
-    end
-    if not silent then self:status_toast("公众号","正在获取公众号列表",2) end
-    local started,err=self.mp_async:run("mp-accounts",function()
-        return self.mp:accounts({force=true})
-    end,function(result)
-        self.store:reload()
-        if result and result.ok and type(result.value)=="table" then
-            if on_done then on_done(result.value,nil) end
-        else
-            local cached=self.mp:cached_accounts()
-            local message=result and result.error or "公众号列表加载失败"
-            logger.warn("[SoweRead][MP] account list refresh failed",tostring(message))
-            if on_done then on_done(#cached>0 and cached or nil,message) end
-        end
-    end,60)
-    if not started then
-        if on_done then on_done(nil,err or "无法启动公众号列表任务") end
-        if not silent then self:info(self:_friendly_remote_error(err or "无法启动公众号列表任务","公众号列表加载")) end
-    end
-    return started
-end
-
-function Plugin:show_mp_shelf(force_remote)
-    self:_save_shelf_context("account", true)
-
-    local function render(accounts, remote_error)
-        accounts = type(accounts) == "table" and accounts or {}
-        local rows = {}
-        for _, account in ipairs(accounts) do
-            local row = self:_mp_normalize_book(account)
-            if Protocol.is_mp_account(row.bookId) then
-                row.content_type = "mp_account"
-                row.author = row.author ~= "" and row.author or "公众号"
-                row.status_text = "点击查看文章"
-                row.show_cover = false
-                rows[#rows + 1] = row
-            end
-        end
-
-        local function refresh()
-            self:_refresh_mp_accounts(function(value, err)
-                if value then self:show_mp_shelf(false)
-                elseif err then self:info(self:_friendly_remote_error(err, "公众号列表加载")) end
-            end, false)
-        end
-
-        local function search()
-            local dialog
-            dialog = InputDialog:new{
-                title="搜索公众号", input="",
-                buttons={{
-                    {text=_("Cancel"), id="close", callback=function() UIManager:close(dialog) end},
-                    {text=_("Search"), is_enter_default=true, callback=function()
-                        local query=U.trim(dialog:getInputText()):lower()
-                        UIManager:close(dialog)
-                        if query=="" then return end
-                        local found={}
-                        for _, row in ipairs(rows) do
-                            local hay=(tostring(row.title or "").." "..tostring(row.author or "")):lower()
-                            if hay:find(query,1,true) then found[#found+1]=row end
-                        end
-                        if #found==0 then self:info("没有找到相关公众号")
-                        elseif #found==1 then self:mp_account(found[1])
-                        else
-                            local items={}
-                            for _, row in ipairs(found) do
-                                local account=row
-                                items[#items+1]={text=account.title,post_text=account.author,callback=function() self:mp_account(account) end}
-                            end
-                            self:list("公众号 · 搜索结果",items)
-                        end
-                    end},
-                }},
-            }
-            UIManager:show(dialog)
-            dialog:onShowKeyboard()
-        end
-
-        if #rows == 0 then
-            local items={
-                {text="书籍",callback=function() self:_reopen_shelf(false,"account") end},
-                {text="公众号",enabled=false},
-                {text="已生成",callback=function() self:_reopen_shelf(false,"generated") end},
-                {text="刷新公众号",enabled=self:logged_in(),callback=refresh},
-            }
-            if not self:logged_in() then
-                items[#items+1]={text="扫码登录",callback=function() self.auth_flow:start() end}
-            end
-            if remote_error then
-                items[#items+1]={text=self:_friendly_remote_error(remote_error,"公众号列表加载"),enabled=false}
-            else
-                items[#items+1]={text="仅显示微信读书书架返回的公众号",enabled=false}
-            end
-            self:list("我的书架 · 公众号",items,"暂未识别到公众号")
-            return
-        end
-
-        local ok, view = pcall(ShelfView.show, {
-            title="我的书架 · 公众号 · "..tostring(#rows).."个",
-            books=rows, selected_tab="mp", tabs=self:_shelf_tabs("mp"),
-            show_covers=false, on_search=search, on_refresh=refresh,
-            on_select=function(book) self:mp_account(book) end,
-            on_close=function(current)
-                if self._shelf_view==current then self._shelf_view=nil end
-            end,
-        })
-        if ok and view then self._shelf_view=view; return end
-        logger.warn("[SoweRead][MP] shelf view unavailable",tostring(view))
-        local items={
-            {text="书籍",callback=function() self:_reopen_shelf(false,"account") end},
-            {text="公众号",enabled=false},
-            {text="已生成",callback=function() self:_reopen_shelf(false,"generated") end},
-            {text="搜索",callback=search},
-            {text="刷新公众号",callback=refresh},
-        }
-        for _,row in ipairs(rows) do
-            local account=row
-            items[#items+1]={text=account.title,post_text=account.author,callback=function() self:mp_account(account) end}
-        end
-        self:list("我的书架 · 公众号",items)
-    end
-
-    local cached=self.mp:cached_accounts()
-    if not force_remote and #cached>0 then
-        render(cached,nil)
-        if self.mp:accounts_stale() and self:logged_in() and self:is_online() and not self.mp_async:busy() then
-            self:_refresh_mp_accounts(function(value)
-                if value and self._shelf_view and not self._shelf_view._miu_closed then
-                    self:_reopen_shelf(true,"account")
-                end
-            end,true)
-        end
-        return
-    end
-    self:_refresh_mp_accounts(function(value,err)
-        if value then render(value,err) else render(cached,err) end
-    end,false)
-end
 
 function Plugin:show_shelf(mp_mode,force_remote,section)
     local prefs=self.store:preferences()
@@ -2273,9 +2117,6 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
     section=section=="generated" and "generated" or "account"
     if mp_mode==nil then mp_mode=tostring(prefs.account_shelf_kind or "books")=="mp" end
     self:_save_shelf_context(section,mp_mode)
-    if section=="account" and mp_mode==true then
-        return self:show_mp_shelf(force_remote==true)
-    end
     self:load_shelf(function(remote_books,remote_mp,remote_error)
         local remote_known=remote_error==nil and (self:logged_in() or (#remote_books+#remote_mp)>0)
         local all_rows=self:_shelf_rows(section,mp_mode,remote_books,remote_mp,remote_known)
@@ -3676,7 +3517,7 @@ function Plugin:_home_open_section(section)
     if section=="account" then return self:_home_leave_and_run("account shelf",function() self:show_shelf(false,false,"account") end) end
     if section=="generated" then return self:_home_leave_and_run("generated shelf",function() self:show_shelf(false,false,"generated") end) end
     if section=="local" then return self:_home_leave_and_run("local shelf",function() self:show_home_local_library() end) end
-    return self:_home_leave_and_run("mp shelf",function() self:show_mp_shelf(false) end)
+    return self:_home_leave_and_run("account shelf",function() self:show_shelf(false,false,"account") end)
 end
 
 function Plugin:_home_visible_section_keys(sections,home)
@@ -4795,8 +4636,6 @@ function Plugin:reader_quick_panel_settings_menu()
         {text="启用轻松读阅读控制中心",checked_func=function() return self:_reader_preferences().enabled~=false end,keep_menu_open=true,callback=function()
             local reader,preferences=self:_reader_preferences(); reader.enabled=reader.enabled==false; self:_save_reader_preferences(reader,preferences)
         end},
-        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-        {text="评论显示设置",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
 
@@ -6172,9 +6011,6 @@ function Plugin:_home_open_book(book,anchor)
     end
     if book and (book.source=="local" or book.local_file==true) then return self:_home_open_local(book) end
     local id=tostring(book and (book.bookId or book.book_id) or "")
-    if Protocol.is_mp_account(id) then
-        return self:_home_leave_and_run("mp account",function() self:mp_account(book) end)
-    end
     self:_home_attach_local_record(book)
     local record=id~="" and self:_preferred_record(id) or nil
     if record and record.file and U.file_exists(record.file) then
@@ -6975,11 +6811,10 @@ function Plugin:_show_home_search_popup(anchor)
         preferred_direction="below",
         width_ratio=.62,
         title="搜索",
-        subtitle="微信书库、我的书籍与批注分开搜索",
+        subtitle="微信书库与我的书籍分开搜索",
         actions={
             {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
             {icon="▦",label="搜索我的书籍",detail="书架、已生成和本地书籍",callback=function() self:show_home_search_dialog() end},
-            {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
         },
     }
 end
@@ -7192,11 +7027,9 @@ function Plugin:_home_action_function_actions(key,anchor)
     if key=="search" then return {
         {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
         {icon="▦",label="搜索我的书籍",detail="书架、已生成和本地书籍",callback=function() self:show_home_search_dialog() end},
-        {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
         {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
         {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
         {icon="▤",label="本地书库",detail="浏览本地书籍",callback=function() self:show_home_local_library() end},
-        {icon="◎",label="公众号",detail="切换到公众号书架",callback=function() self:_set_home_section("mp") end},
     } end
     if key=="downloads" then return {
         {icon="⇩",label="下载任务",detail="进度 排队与失败重试",callback=function() self:show_downloads() end},
@@ -7403,30 +7236,6 @@ function Plugin:_home_hold_book(book,anchor)
         return
     end
     local id=tostring(book.bookId or book.book_id or "")
-    if Protocol.is_mp_account(id) then
-        local target=U.copy(book)
-        ActionSheet.show{
-            anchor=anchor,
-            preferred_direction="above",
-            width_ratio=.62,
-            title=tostring(target.title or "公众号"),
-            subtitle=U.trim(tostring(target.author or ""))~="" and tostring(target.author) or "公众号内容",
-            actions={
-                {icon="i",label="查看信息",detail="作者与简介",callback=function()
-                    local lines={tostring(target.title or "公众号")}
-                    if U.trim(tostring(target.author or ""))~="" then lines[#lines+1]="作者："..tostring(target.author) end
-                    if U.trim(tostring(target.description or target.intro or ""))~="" then lines[#lines+1]="\n"..tostring(target.description or target.intro) end
-                    self:info(table.concat(lines,"\n"))
-                end},
-                {icon="↻",label="刷新并打开",detail="更新文章列表后打开",callback=function()
-                    self:_refresh_shelf_async(function() self:mp_account(target) end,false)
-                end},
-                {icon="⇩",label="下载管理",detail="查看文章下载任务",callback=function() self:show_downloads() end},
-            },
-            wide_last=true,
-        }
-        return
-    end
     if book.source=="local" or book.local_file==true then
         ActionSheet.show{
             anchor=anchor,
@@ -7555,23 +7364,6 @@ function Plugin:_home_download_notice()
         notice.on_tap=function() self:_home_leave_and_run("downloads",function() self:show_downloads() end) end
     end
     return notice
-end
-
-function Plugin:_home_library_sections(account_count,generated_count,local_count,mp_count)
-    return {
-        {title="微信书架",detail="账号中的全部书籍",count=account_count,on_tap=function()
-            self:_home_leave_and_run("account shelf",function() self:show_shelf(false,false,"account") end)
-        end},
-        {title="已下载",detail="已保存到设备",count=generated_count,on_tap=function()
-            self:_home_leave_and_run("generated shelf",function() self:show_shelf(false,false,"generated") end)
-        end},
-        {title="本地书籍",detail="KOReader 普通文件",count=local_count,on_tap=function()
-            self:_home_leave_and_run("local shelf",function() self:show_home_local_library() end)
-        end},
-        {title="公众号",detail="公众号与文章",count=mp_count,on_tap=function()
-            self:_home_leave_and_run("mp shelf",function() self:show_mp_shelf(false) end)
-        end},
-    }
 end
 
 function Plugin:_home_alerts()
@@ -9223,10 +9015,9 @@ function Plugin:maintenance_menu()
                 end},
             }
         end},
-        {text="书籍修复",post_text="完整性与旧评论数据",sub_item_table_func=function()
+        {text="书籍修复",post_text="完整性检查",sub_item_table_func=function()
             return {
                 {text="检查下载完整性",callback=function() self:scan_downloaded_books_for_integrity_repair() end},
-                {text="评论数据迁移",sub_item_table_func=function() return self:book_repair_settings_menu() end},
             }
         end},
         {text="存储清理",post_text="临时文件 缓存与旧记录",callback=function() self:show_download_cleanup_dialog() end},
@@ -9905,144 +9696,6 @@ function Plugin:_show_reader_weight_panel(back_callback)
                     {label="默认",value="0",checked=math.abs(current)<.01,keep_open=true,callback=function() self:_reader_set_font_weight(0) end},
                     {label="较粗",value="0.5",checked=math.abs(current-.5)<.01,keep_open=true,callback=function() self:_reader_set_font_weight(.5) end},
                 }},
-            }
-        end,
-    }
-    return true
-end
-
-function Plugin:_thoughts_enabled()
-    return (self.store:preferences().thoughts or {}).enabled~=false
-end
-
-function Plugin:_set_thoughts_enabled(enabled)
-    enabled=enabled~=false
-    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-    if (p.thoughts.enabled~=false)==enabled then return true end
-    p.thoughts.enabled=enabled
-    self:_save_ui_preferences(p,"thoughts_enabled")
-    local current=self.sync and self.sync.current or nil
-    local record=current and current.record or {}
-    local variant=tostring(current and (current.variant or record.variant) or "")
-    local annotation_book=current and (record.annotation_requested==true or variant:find("notes",1,true))
-    if enabled then
-        if annotation_book then self:_setup_thought_tap() end
-        self:toast("阅读评论已开启",1.5)
-    else
-        self:_close_active_thought_popup("comments disabled")
-        -- Keep the SoweRead internal-link guard installed. Hiding comments must
-        -- not hand #miuthought links back to KOReader as invalid external links.
-        if annotation_book then self:_setup_thought_tap() end
-        self:toast("阅读评论已关闭，划线和评论数据不会删除",2)
-    end
-    return true
-end
-
-function Plugin:_toggle_thoughts_enabled()
-    return self:_set_thoughts_enabled(not self:_thoughts_enabled())
-end
-
-function Plugin:_thoughts_enabled_label()
-    return self:_thoughts_enabled() and "已开启" or "已关闭"
-end
-
-function Plugin:_thought_font_size_value(prefs)
-    prefs=prefs or (self.store:preferences().thoughts or {})
-    local numeric=tonumber(prefs.font_size)
-    if numeric then return math.max(12,math.min(48,math.floor(numeric+.5))) end
-    local legacy={small=18,standard=22,large=26,xlarge=30}
-    return legacy[tostring(prefs.font or "standard")] or 22
-end
-
-function Plugin:_thought_font_size_label()
-    return tostring(self:_thought_font_size_value())
-end
-
-function Plugin:_set_thought_font_size(value,quiet)
-    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-    local target=math.max(12,math.min(48,math.floor((tonumber(value) or self:_thought_font_size_value(p.thoughts))+.5)))
-    p.thoughts.font_size=target
-    -- Keep the legacy field readable for one compatibility cycle, but the
-    -- continuous numeric value is authoritative from beta.8 onward.
-    p.thoughts.font=nil
-    self:_save_ui_preferences(p,"thought_font_size")
-    self:_refresh_thought_display(p.thoughts)
-    if quiet~=true then self:toast("评论字号："..tostring(target),1.2) end
-    return true
-end
-
-function Plugin:_adjust_thought_font_size(delta)
-    return self:_set_thought_font_size(self:_thought_font_size_value()+(tonumber(delta) or 0),true)
-end
-
-function Plugin:_refresh_thought_display(prefs)
-    prefs=prefs or (self.store:preferences().thoughts or {})
-    if ThoughtNativePopup and type(ThoughtNativePopup.refresh_font)=="function" then
-        pcall(ThoughtNativePopup.refresh_font,
-            self:_thought_font_size(self:_thought_font_size_value(prefs)),
-            self:_thought_font_name(prefs))
-    end
-end
-
-function Plugin:_toggle_thought_follow_body_font()
-    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-    p.thoughts.follow_body_font=p.thoughts.follow_body_font~=true
-    self:_save_ui_preferences(p,"thought_font_follow")
-    self:_refresh_thought_display(p.thoughts)
-    return true
-end
-
-function Plugin:_show_reader_comment_settings(back_callback)
-    local return_to_comments=function() self:_show_reader_comment_settings(back_callback) end
-    local function comment_preview_text()
-        return "这是一段评论文字，用来预览当前字体、字号和实际阅读效果。"
-    end
-    ReaderTypographyDialog.show{
-        title="评论显示",
-        subtitle=function()
-            if not self:_thoughts_enabled() then return "阅读评论已关闭 · 划线与评论数据仍保留" end
-            local prefs=self.store:preferences().thoughts or {}
-            return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · 字号 "..self:_thought_font_size_label()
-        end,
-        on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:return_to_soweread_home("reader surface") end,
-        controls=function()
-            local prefs=self.store:preferences().thoughts or {}
-            local follow=prefs.follow_body_font==true
-            return {
-                {kind="select",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_toggle_thoughts_enabled() end},
-                {kind="select",label="评论字体",value=follow and ("跟随正文 · "..self:_reader_font_label()) or self:_thought_font_face_label(prefs),close=true,callback=function()
-                    self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),return_to_comments)
-                end},
-                {kind="step",label="字号",value=function() return self:_thought_font_size_label() end,
-                    on_decrease=function() self:_adjust_thought_font_size(-1) end,
-                    on_increase=function() self:_adjust_thought_font_size(1) end,
-                    on_decrease_hold=function() self:_adjust_thought_font_size(-3) end,
-                    on_increase_hold=function() self:_adjust_thought_font_size(3) end},
-                {kind="select",label="跟随正文字体",value=follow and "已开启" or "已关闭",value_bold=true,callback=function() self:_toggle_thought_follow_body_font() end},
-            }
-        end,
-        preview_label="评论预览",
-        preview_text=comment_preview_text,
-        preview_font=function() return self:_thought_font_name(self.store:preferences().thoughts or {}) end,
-        preview_size=function() return self:_thought_font_size_value() end,
-        preview_line_height=.18,
-        actions=function()
-            return {
-                {label="恢复默认",callback=function()
-                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-                    p.thoughts.font_size=22; p.thoughts.font=nil; p.thoughts.font_face=""; p.thoughts.follow_body_font=false
-                    self:_save_ui_preferences(p,"thought_font_reset")
-                    self:_refresh_thought_display(p.thoughts)
-                    self:toast("评论显示已恢复默认",1.5)
-                end},
-                {label="应用到全部评论",primary=true,callback=function()
-                    -- 评论显示偏好本身就是轻松读全局偏好；这里显式保存并
-                    -- 给用户一个明确的“应用到全部”操作，而不再另造一份状态。
-                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-                    self:_save_ui_preferences(p,"thought_font_global")
-                    self:toast("已应用到全部评论",1.5)
-                end},
             }
         end,
     }
@@ -11792,7 +11445,6 @@ function Plugin:_show_reader_gesture_panel(back_callback)
                 {label="顶部下滑",value="轻松读阅读快捷面板",arrow=false},
                 {label="向上滑动",value="收起快捷面板",arrow=false},
                 {label="正文区域",value="保持翻页与选词手势",arrow=false},
-                {label="阅读评论",value=self:_thoughts_enabled_label(),keep_open=true,callback=function() self:_toggle_thoughts_enabled() end},
             }
         end,
     }
@@ -11825,10 +11477,7 @@ function Plugin:_reader_control_categories()
         {key="reading",label="阅读",sections={{items={
             {icon="toc",label="目录",value="当前章节",callback=function() self:_show_reader_toc(back_to("reading")) end},
             {icon="progress",label="阅读进度",value=(self:_reader_progress_percent() and (tostring(math.floor(self:_reader_progress_percent()+.5)).."%") or ""),callback=function() self:_show_reader_progress_control(back_to("reading")) end},
-            {icon="search",label="书内搜索",value="搜索当前书籍",callback=function() self:_reader_show_search(back_to("reading")) end},
             {icon="undo",label="回到阅读处",value="返回跳转前位置",callback=function() self:_reader_go_back_location() end},
-            {icon="highlight",label="批注",value=self:_reader_annotation_summary_label(),callback=function() self:_show_reader_annotation_panel(back_to("reading")) end},
-            {icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end},
         }}}},
         {key="typeset",label="排版",sections={{items={
             {icon="font",label="字体与字号",value=self:_reader_font_label().." · "..self:_reader_font_size_label(),callback=function() self:_show_reader_font_panel(back_to("typeset")) end},
@@ -11840,9 +11489,6 @@ function Plugin:_reader_control_categories()
             {icon="current-book",label="当前书籍",value="信息与本地状态",callback=function() self:_show_reader_current_book_panel(back_to("book")) end},
             {icon="sync",label="阅读同步",value=self:progress_sync_label(),value_bold=true,callback=function() self:_show_reader_sync_panel(back_to("book")) end},
             {icon="download",label="下载与生成",value="任务、失败重试与重新生成",callback=function() self:show_downloads(back_to("book")) end},
-            {icon="comment",label="评论数据",value="迁移与显示设置",callback=function()
-                self:_show_reader_menu_table("评论数据",self:book_repair_settings_menu(),back_to("book"))
-            end},
             {icon="repair",label="检查与修复",value="书籍与阅读同步",callback=function() self:check_and_repair_current() end},
         }}}},
         {key="device",label="设备",sections={{items={
@@ -11915,18 +11561,10 @@ function Plugin:_reader_quick_definitions()
     return {
         toc={key="toc",icon="toc",label="目录",callback=function() self:_show_reader_toc(function() self:show_reader_quick_panel() end) end},
         progress={key="progress",icon="progress",label="进度",callback=function() self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end},
-        search={key="search",icon="search",label="搜索",icon_scale=.94,callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
         back={key="back",icon="undo",label="回到阅读",icon_scale=.98,callback=function() self:_reader_go_back_location() end},
         font={key="font",icon="font",label="字体",callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end},
         spacing={key="spacing",icon="line-spacing",label="行距",callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end},
         page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
-        comments={key="comments",icon="comment",label="评论",icon_scale=1.16,icon_nudge_y=-1,active=self:_thoughts_enabled(),callback=function()
-            self:_show_reader_comment_settings(function() self:show_reader_quick_panel() end)
-        end,hold_callback=function()
-            self:_toggle_thoughts_enabled()
-            UIManager:scheduleIn(.05,function() self:show_reader_quick_panel() end)
-        end},
-        annotations={key="annotations",icon="highlight",label="批注",icon_scale=1.28,icon_nudge_y=-2,callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
         edge_guard={key="edge_guard",icon=edge_enabled and "edge-guard" or "edge-guard-off",label="防误触",icon_scale=1.02,active=edge_enabled,callback=function()
             self:_show_reader_edge_guard_panel(function() self:show_reader_quick_panel() end)
         end},
@@ -13597,289 +13235,10 @@ function Plugin:_preferred_record(book_id)
     end
     return fallback
 end
-local function mp_date(value)
-    value=tonumber(value or 0) or 0
-    return value>0 and os.date("%Y-%m-%d",value) or ""
-end
-
-function Plugin:_mp_normalize_book(book)
-    local original=type(book)=="table" and book or {}
-    local normalized=U.merge(original,normalize(original))
-    normalized.bookId=tostring(normalized.bookId or normalized.book_id or "")
-    return normalized
-end
-
-function Plugin:_refresh_mp_articles(book,silent,on_done)
-    book=self:_mp_normalize_book(book)
-    if not self:logged_in() then
-        if not silent then self.auth_flow:start() end
-        if on_done then on_done(nil,"尚未登录") end
-        return false
-    end
-    if not self:is_online() then
-        if not silent then self:info(_("Network unavailable")) end
-        if on_done then on_done(nil,"网络不可用") end
-        return false
-    end
-    if self.mp_async:busy() then
-        if not silent then self:info("另一项公众号任务正在进行中。") end
-        return false
-    end
-    if not silent then self:status_toast("公众号","正在刷新文章列表",2) end
-    local book_copy=U.copy(book)
-    local started,err=self.mp_async:run("mp-articles",function()
-        return self.mp:articles(book_copy.bookId,{force=true,title=book_copy.title})
-    end,function(result)
-        self.store:reload()
-        if result and result.ok and type(result.value)=="table" then
-            if on_done then on_done(result.value,nil) end
-            if not silent then self:show_mp_articles(book_copy,result.value) end
-        else
-            local cached=self.mp:cached_articles(book_copy.bookId)
-            local message=result and result.error or "文章列表刷新失败"
-            logger.warn("[SoweRead][MP] article list refresh failed",tostring(message))
-            if on_done then on_done(#cached>0 and cached or nil,message) end
-            if not silent then
-                if #cached>0 then self:toast("刷新失败，继续显示本地文章列表",3); self:show_mp_articles(book_copy,cached)
-                else self:info(self:_friendly_remote_error(message,"公众号文章列表加载")) end
-            end
-        end
-    end,75)
-    if not started and not silent then self:info(self:_friendly_remote_error(err or "无法启动文章列表任务","公众号文章列表加载")) end
-    return started
-end
-
-function Plugin:mp_account(book)
-    book=self:_mp_normalize_book(book)
-    if not Protocol.is_mp_account(book.bookId) then
-        self:info("微信读书书架没有返回可用的公众号。")
-        return
-    end
-    book.content_type="mp_account"
-    self.store:save_book(book.bookId,{
-        book_id=book.bookId,title=book.title,author=book.author,cover=book.cover,
-        content_type="mp_account",updated_at=os.time(),
-    })
-    local cached=self.mp:cached_articles(book.bookId)
-    if #cached>0 then
-        self:show_mp_articles(book,cached)
-        if self.mp:list_stale(book.bookId) and self:logged_in() and self:is_online() and not self.mp_async:busy() then
-            self:_refresh_mp_articles(book,true)
-        end
-    else
-        self:_refresh_mp_articles(book,false)
-    end
-end
-
-function Plugin:open_mp_account_by_id(book_id,title)
-    local found
-    local accounts=self.mp:cached_accounts()
-    for _,book in ipairs(accounts or {}) do
-        if tostring(book.bookId or book.book_id)==tostring(book_id) then found=book; break end
-    end
-    if not found then
-        local _,cached_mp=self.library:cached()
-        for _,book in ipairs(cached_mp or {}) do
-            if tostring(book.bookId or book.book_id)==tostring(book_id) then found=book; break end
-        end
-    end
-    found=found or {bookId=book_id,title=title or "公众号",author="公众号",content_type="mp_account"}
-    self:mp_account(found)
-end
-
-function Plugin:show_mp_articles(book,articles,title_suffix)
-    book=self:_mp_normalize_book(book)
-    articles=type(articles)=="table" and articles or {}
-    local items={
-        {text="搜索文章",callback=function() self:mp_search_dialog(book,articles) end},
-        {text="刷新文章列表",post_text="最近 100 篇",callback=function() self:_refresh_mp_articles(book,false) end},
-        {text="管理本号缓存",callback=function()
-            self:list("缓存管理 · "..tostring(book.title or "公众号"),self:mp_cache_menu(book,self.mp:cached_articles(book.bookId)),"暂无缓存")
-        end},
-    }
-    for _,row in ipairs(articles) do
-        local article=U.copy(row)
-        local record=self.mp:article_record(book.bookId,article)
-        local post=mp_date(article.createTime)
-        if record then post=(post~="" and (post.." · ") or "").."已缓存" end
-        items[#items+1]={
-            text=tostring(article.title or "文章"),post_text=post,
-            callback=function() self:open_or_download_mp_article(book,article) end,
-        }
-    end
-    local title=tostring(book.title or "公众号").." · "..tostring(#articles).."篇"
-    if title_suffix then title=title.." · "..tostring(title_suffix) end
-    self:list(title,items,"暂无文章")
-end
-
-function Plugin:mp_search_dialog(book,articles)
-    local dialog
-    dialog=InputDialog:new{
-        title="搜索本号文章",input="",
-        buttons={{
-            {text=_("Cancel"),id="close",callback=function() UIManager:close(dialog) end},
-            {text=_("Search"),is_enter_default=true,callback=function()
-                local query=U.trim(dialog:getInputText()):lower()
-                UIManager:close(dialog)
-                if query=="" then return end
-                local results={}
-                for _,article in ipairs(articles or {}) do
-                    if tostring(article.title or ""):lower():find(query,1,true) then results[#results+1]=article end
-                end
-                if #results==0 then self:info("没有找到相关文章") else self:show_mp_articles(book,results,"搜索结果") end
-            end},
-        }},
-    }
-    UIManager:show(dialog); dialog:onShowKeyboard()
-end
-
-function Plugin:_close_mp_download_dialog()
-    local dialog=self._mp_download_dialog
-    self._mp_download_dialog=nil
-    if dialog then pcall(function() UIManager:close(dialog) end) end
-end
-
-function Plugin:_start_mp_article_download(book,article,force)
-    if self.mp_async:busy() then self:info("另一项公众号任务正在进行中。") return false end
-    local title=tostring(article.title or "文章")
-    local cancelled=false
-    local dialog
-    dialog=ButtonDialog:new{
-        title="正在下载公众号文章\n\n"..title.."\n\n文章通常较小，下载完成后会自动打开。",
-        title_align="left",
-        buttons={{{text="取消下载",callback=function()
-            cancelled=true
-            if self.mp_async and self.mp_async:busy() then self.mp_async:cancel("user_cancelled") end
-            self:_close_mp_download_dialog()
-            self:status_toast("公众号","已取消下载",3)
-        end}}},
-    }
-    self._mp_download_dialog=dialog
-    UIManager:show(dialog)
-
-    local book_copy,article_copy=U.copy(book),U.copy(article)
-    local prefs=self.store:preferences()
-    local started,err=self.mp_async:run("mp-article",function()
-        return self.mp:fetch_article(book_copy,article_copy,{images=prefs.mp_images==true,force=force==true})
-    end,function(result)
-        self:_close_mp_download_dialog()
-        if cancelled then return end
-        self.store:reload()
-        if result and result.ok and type(result.value)=="table" and result.value.file then
-            self:open_file(result.value.file)
-            return
-        end
-        local fallback=self.mp:article_record(book_copy.bookId,article_copy)
-        if fallback then
-            self:status_toast("公众号","下载未完整完成，已打开原缓存",4)
-            self:open_file(fallback.file)
-        else
-            logger.warn("[SoweRead][MP] article download failed",tostring(result and result.error))
-            self:info("文章下载失败：\n"..U.first_line(result and result.error or "未知错误",180))
-        end
-    end,120)
-    if not started then
-        self:_close_mp_download_dialog()
-        self:info("无法启动文章下载：\n"..tostring(err))
-        return false
-    end
-    return true
-end
-
-function Plugin:open_or_download_mp_article(book,article,force)
-    local record=self.mp:article_record(book.bookId,article)
-    if record and force~=true then self:open_file(record.file); return end
-    if not self:require_login() then return end
-    if not self:is_online() then
-        if record then self:open_file(record.file) else self:info(_("Network unavailable")) end
-        return
-    end
-    if force==true then
-        self:_start_mp_article_download(book,article,true)
-        return
-    end
-    UIManager:show(ConfirmBox:new{
-        text="《"..tostring(article.title or "文章").."》尚未缓存。\n\n是否下载并打开？公众号文章通常只需几秒。",
-        ok_text="下载并打开",
-        ok_callback=function() self:_start_mp_article_download(book,article,false) end,
-    })
-end
-
-function Plugin:mp_cache_menu(book,articles)
-    local items={}
-    local cached_count=0
-    for _,article in ipairs(articles or {}) do
-        if self.mp:article_record(book.bookId,article) then cached_count=cached_count+1 end
-    end
-    items[#items+1]={text="已缓存文章",post_text=tostring(cached_count).." 篇",enabled=false}
-    for _,row in ipairs(articles or {}) do
-        local article=U.copy(row)
-        if self.mp:article_record(book.bookId,article) then
-            items[#items+1]={text=tostring(article.title or "文章"),post_text=mp_date(article.createTime),callback=function()
-                self:mp_article_cache_menu(book,article)
-            end}
-        end
-    end
-    items[#items+1]={text="清理本号文章缓存",callback=function()
-        UIManager:show(ConfirmBox:new{text="清理《"..tostring(book.title or "公众号").."》的文章列表和单篇缓存？",ok_callback=function()
-            local ok,err=self.mp:clear_account(book.bookId)
-            if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
-            self:status_toast("公众号","本号缓存已清理",4)
-            UIManager:scheduleIn(.15,function() self:show_mp_articles(book,articles,"缓存已清理") end)
-        end})
-    end}
-    return items
-end
-
-function Plugin:mp_article_cache_menu(book,article)
-    local items={
-        {text="打开文章",callback=function() self:open_or_download_mp_article(book,article) end},
-        {text="重新下载文章",callback=function() self:open_or_download_mp_article(book,article,true) end},
-        {text="删除单篇缓存",callback=function()
-            UIManager:show(ConfirmBox:new{text="删除《"..tostring(article.title or "文章").."》的单篇缓存？",ok_callback=function()
-                local ok,err=self.mp:clear_article(book.bookId,article)
-                if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
-                self:status_toast("公众号","本篇缓存已删除",4)
-                UIManager:scheduleIn(.15,function()
-                    self:list("缓存管理 · "..tostring(book.title or "公众号"),self:mp_cache_menu(book,self.mp:cached_articles(book.bookId)),"暂无缓存")
-                end)
-            end})
-        end},
-    }
-    self:list(article.title or "文章",items)
-end
-
-function Plugin:mp_global_cache_menu()
-    return {
-        {text="清理全部公众号缓存",callback=function()
-            UIManager:show(ConfirmBox:new{text="清理全部公众号列表和单篇文章缓存？",ok_callback=function()
-                local ok,err=U.remove_tree(self.store:mp_root())
-                if not ok then self:info("缓存删除失败：\n"..tostring(err or "无法删除目录")); return end
-                if not U.mkdir(self.store:mp_root()) then self:info("缓存目录重建失败，请重启 KOReader。") return end
-                self:status_toast("公众号","全部缓存已清理",4)
-            end})
-        end},
-    }
-end
-
-function Plugin:open_mp_neighbor(delta)
-    local context=self.mp:identify_path(self:_current_document_path())
-    if not context then self:info("当前不是轻松读公众号文章。") return end
-    local articles=self.mp:cached_articles(context.bookId)
-    local index
-    for i,article in ipairs(articles or {}) do
-        if tostring(article.reviewId or article.originalId)==tostring(context.reviewId) then index=i; break end
-    end
-    if not index then self:info("本地文章列表中找不到当前位置。") return end
-    local target=articles[index+(tonumber(delta) or 0)]
-    if not target then self:toast((delta or 0)<0 and "已经是第一篇" or "已经是最后一篇",2); return end
-    self:open_or_download_mp_article({bookId=context.bookId,title=context.account_title or "公众号",author="公众号"},target)
-end
 
 function Plugin:book_menu(b)
     local original=type(b)=="table" and b or {}
     b=U.merge(original,normalize(original))
-    if Protocol.is_mp_account(b.bookId) then self:mp_account(b); return end
     local items={}
     local records={{kind="clean",label="纯净版"},{kind="notes",label="划线与想法版"},
         {kind="range_clean",label="章节版 · 纯净版"},{kind="range_notes",label="章节版 · 划线与想法版"},
@@ -15499,10 +14858,6 @@ function Plugin:_commit_complete_book_delete(book_id,documents)
     if self._cover_index_pending then self._cover_index_pending[book_id]=nil end
     local repair_pending=self._book_repair_pending
     if type(repair_pending)=="table" then repair_pending[book_id]=nil end
-    Thoughts.clear_memory_cache()
-    if ThoughtNativePopup and type(ThoughtNativePopup.clear_cache)=="function" then
-        pcall(ThoughtNativePopup.clear_cache)
-    end
     self.store:prune_missing_files()
     self:_notify_home_data_changed("content")
 end
@@ -15882,40 +15237,14 @@ function Plugin:sync_diagnostics_menu()
 end
 
 function Plugin:_schedule_home_annotation_summary_refresh(force)
-    local now=os.time()
-    if force~=true and type(self._annotation_summary_cache)=="table"
-        and now-(tonumber(self._annotation_summary_cache_at) or 0)<12 then return false end
-    if self.sync_summary_async and self.sync_summary_async:busy() then return false end
-    if self._home_sync_summary_task then return false end
-    local task
-    task=function()
-        if self._home_sync_summary_task~=task then return end
-        if self:_home_ui_busy() or self:_active_reader_ui() then
-            UIManager:scheduleIn(.55,task)
-            return
-        end
-        self._home_sync_summary_task=nil
-        if not self.sync_summary_async or not self.sync_summary_async:available() then return end
-        local started,err=self.sync_summary_async:run("annotation-summary",function()
-            return LocalAnnotationDatabase.global_summary(self.store) or {}
-        end,function(result)
-            if result and result.ok and type(result.value)=="table" then
-                self._annotation_summary_cache=result.value
-                self._annotation_summary_cache_at=os.time()
-                self._home_sync_summary_cache=nil
-                self._home_sync_summary_cache_at=nil
-                if HomeView.is_shown() and not self:_active_reader_ui() then
-                    self:_notify_home_data_changed("header")
-                end
-            elseif result and result.error then
-                logger.warn("[SoweRead][SyncSummary] refresh failed",tostring(result.error))
-            end
-        end,20)
-        if not started then logger.warn("[SoweRead][SyncSummary] worker unavailable",tostring(err or "unknown")) end
+    -- Annotation tracking was removed along with the annotations feature;
+    -- keep self._annotation_summary_cache permanently empty so
+    -- _home_sync_summary's highlight/thought/bookmark counts stay at 0.
+    if type(self._annotation_summary_cache)~="table" then
+        self._annotation_summary_cache={}
+        self._annotation_summary_cache_at=os.time()
     end
-    self._home_sync_summary_task=task
-    UIManager:scheduleIn(force==true and .12 or .70,task)
-    return true
+    return false
 end
 
 function Plugin:_home_sync_summary(force)
@@ -16058,47 +15387,7 @@ function Plugin:_sync_home_pending()
         return true
     end
 
-    local age=os.time()-(tonumber(self._annotation_summary_cache_at) or 0)
-    if type(self._annotation_summary_cache)=="table" and age<=6 then
-        return proceed(self:_home_sync_summary(false))
-    end
-    -- A manual sync must never claim "已同步" from an unknown annotation
-    -- snapshot. Do the exact multi-book SQLite count in a subprocess, then
-    -- continue with the result without blocking the tap animation.
-    if self.sync_summary_async and self.sync_summary_async:available() and not self.sync_summary_async:busy() then
-        self:toast("正在检查待同步内容…",2)
-        local started,err=self.sync_summary_async:run("annotation-summary-manual",function()
-            return LocalAnnotationDatabase.global_summary(self.store) or {}
-        end,function(result)
-            if result and result.ok and type(result.value)=="table" then
-                self._annotation_summary_cache=result.value
-                self._annotation_summary_cache_at=os.time()
-                proceed(self:_home_sync_summary(false))
-            else
-                self:info("无法检查本地划线与想法\n\n"..tostring(result and result.error or "后台检查失败"))
-            end
-        end,20)
-        if started then return true end
-        logger.warn("[SoweRead][SyncSummary] manual start failed",tostring(err or "unknown"))
-    elseif self.sync_summary_async and self.sync_summary_async:busy() then
-        self:toast("正在检查同步状态…",2)
-        local generation=(tonumber(self._home_sync_manual_wait_generation) or 0)+1
-        self._home_sync_manual_wait_generation=generation
-        local wait
-        wait=function()
-            if generation~=self._home_sync_manual_wait_generation then return end
-            if self.sync_summary_async and self.sync_summary_async:busy() then UIManager:scheduleIn(.45,wait); return end
-            if type(self._annotation_summary_cache)=="table" then proceed(self:_home_sync_summary(false))
-            else self:info("同步状态检查未完成 请稍后重试") end
-        end
-        UIManager:scheduleIn(.45,wait)
-        return true
-    end
-    -- Subprocess support is expected on Kindle. If it is unavailable, keep the
-    -- UI responsive and make the limitation explicit rather than performing a
-    -- potentially long full-database scan on the main thread.
-    self:info("当前环境无法在后台检查本地划线与想法 请稍后重试")
-    return false
+    return proceed(self:_home_sync_summary(false))
 end
 
 function Plugin:sync_settings_menu()
@@ -16818,644 +16107,12 @@ function Plugin:redownload_current()
     dialog=ButtonDialog:new{title="重新生成《"..tostring(b.title or "本书").."》",title_align="center",buttons=buttons}
     UIManager:show(dialog)
 end
-function Plugin:_repair_preferences()
-    local preferences=self.store:preferences()
-    preferences.repair=type(preferences.repair)=="table" and preferences.repair or {}
-    if preferences.repair.auto_check==nil then preferences.repair.auto_check=true end
-    return preferences.repair,preferences
-end
-
-function Plugin:_repair_context(current)
-    if type(current)=="table" and current.book then
-        return {
-            book=current.book,
-            record=current.record or {},
-            variant=current.variant,
-            path=current.path,
-            title=current.book and current.book.title,
-        }
-    end
-    local row=self:_current_book_record()
-    if not row then return nil end
-    return {
-        book=row.book,
-        record=row.record or {},
-        variant=row.variant,
-        path=row.path,
-        title=row.book and row.book.title,
-    }
-end
-
-function Plugin:_repair_state()
-    local state=self.store:get("book_repair_state",{})
-    return type(state)=="table" and state or {}
-end
-
-function Plugin:_save_repair_state(book_id,row)
-    local state=self:_repair_state()
-    state[tostring(book_id or "")]=row
-    self.store:set("book_repair_state",state)
-end
-
-function Plugin:_record_repair_history(result,status)
-    local history=self.store:get("book_repair_history",{})
-    if type(history)~="table" then history={} end
-    table.insert(history,1,{
-        at=os.time(),
-        title=tostring(result and result.title or "书籍"),
-        book_id=tostring(result and result.book_id or ""),
-        status=tostring(status or ((result and result.ok) and "已完成" or "失败")),
-    })
-    while #history>20 do table.remove(history) end
-    self.store:set("book_repair_history",history)
-end
-
-function Plugin:_repair_message(report)
-    local lines={"检测到本书仍有旧版 JSON 想法与评论数据。"}
-    lines[#lines+1]=""
-    lines[#lines+1]="迁移后将直接使用 SQLite，旧评论索引不再需要。"
-    lines[#lines+1]="迁移不会重新下载书籍，也不会改动 EPUB 正文。"
-    if tonumber(report and report.pending or 0)>0 then
-        lines[#lines+1]=""
-        lines[#lines+1]="待迁移章节："..tostring(report.pending)
-    end
-    return table.concat(lines,"\n")
-end
-
-function Plugin:_close_migration_progress(token)
-    if token and self._migration_token~=token then return end
-    if self._migration_progress_poll then
-        UIManager:unschedule(self._migration_progress_poll)
-        self._migration_progress_poll=nil
-    end
-    if self._migration_progress_delay then
-        UIManager:unschedule(self._migration_progress_delay)
-        self._migration_progress_delay=nil
-    end
-    if self._migration_progress_widget then
-        self._migration_progress_widget:close()
-        self._migration_progress_widget=nil
-    end
-    local active_token=self._migration_token
-    if active_token then DownloadDatabase.clear_task(DownloadDatabase.runtime_path(self.store),active_token) end
-    self._migration_token=nil
-end
-
-function Plugin:_schedule_migration_progress(token,title)
-    self:_close_migration_progress()
-    self._migration_token=token
-    local path=DownloadDatabase.runtime_path(self.store)
-    local function poll()
-        if self._migration_token~=token then return end
-        local state=DownloadDatabase.get_task_value(path,token,"migration_progress",nil)
-        if self._migration_progress_widget and type(state)=="table" then
-            self._migration_progress_widget:set_state(state)
-        end
-        if self.repair_async and self.repair_async:busy() then
-            self._migration_progress_poll=poll
-            UIManager:scheduleIn(.7,poll)
-        end
-    end
-    local delay
-    delay=function()
-        if self._migration_token~=token or not (self.repair_async and self.repair_async:busy()) then return end
-        self._migration_progress_delay=nil
-        local widget=MigrationProgress:new{
-            title="正在迁移《"..tostring(title or "当前书籍").."》",
-            on_cancel=function()
-                DownloadDatabase.set_cancelled(path,token,true)
-            end,
-        }
-        self._migration_progress_widget=widget
-        widget:show()
-        local state=DownloadDatabase.get_task_value(path,token,"migration_progress",nil)
-        if type(state)=="table" then widget:set_state(state) end
-        poll()
-    end
-    self._migration_progress_delay=delay
-    UIManager:scheduleIn(1.0,delay)
-end
-
-function Plugin:_run_book_repair(context,report,force)
-    context=context or self:_repair_context()
-    if not context or not context.book then self:info("当前没有可迁移的轻松读书籍"); return false end
-    if self.repair_async and self.repair_async:busy() then self:toast("已有迁移任务正在进行"); return false end
-    if type(report)~="table" then
-        local repair=self.book_repair
-        self:toast("正在检查本书旧评论数据",2)
-        local started,err=self.repair_async:run("book-migration-check",function()
-            return repair:inspect(context)
-        end,function(result)
-            if not result or result.ok~=true or type(result.value)~="table" then
-                self:info("检查失败：\n"..tostring(result and result.error or "未知原因")); return
-            end
-            self:_run_book_repair(context,result.value,force)
-        end,120)
-        if not started then self:info("无法开始检查：\n"..tostring(err or "未知原因")) end
-        return started
-    end
-    if #(report.issues or {})==0 then
-        self:info("当前书籍已经使用 SQLite，无需迁移。")
-        return true
-    end
-    local title=tostring((context.book or {}).title or context.title or "当前书籍")
-    local token="migration-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))
-    local path=DownloadDatabase.runtime_path(self.store)
-    DownloadDatabase.clear_task(path,token)
-    self:_schedule_migration_progress(token,title)
-    local repair=self.book_repair
-    local started,err=self.repair_async:run("book-data-migration",function()
-        return repair:migrate(context,report,{
-            force=force==true,
-            archive_legacy=false,
-            progress=function(state)
-                DownloadDatabase.set_task_value(path,token,"migration_progress",state)
-            end,
-            cancelled=function()
-                return DownloadDatabase.is_cancelled(path,token)
-            end,
-        })
-    end,function(result)
-        self:_close_migration_progress(token)
-        if not result or result.ok~=true or type(result.value)~="table" then
-            local message=tostring(result and result.error or "迁移任务未完成")
-            self:_record_repair_history({title=title,book_id=(context.book or {}).book_id},"失败")
-            self:info("迁移失败：\n"..message)
-            return
-        end
-        local value=result.value
-        local status=value.cancelled and "已停止" or (value.ok and "已完成" or "部分失败")
-        self:_record_repair_history(value,status)
-        self:_save_repair_state(value.book_id,{
-            signature=value.signature,
-            status=value.ok and "fixed" or (value.cancelled and "pending" or "failed"),
-            checked_at=os.time(),
-        })
-        Thoughts.clear_memory_cache()
-        if ThoughtNativePopup and type(ThoughtNativePopup.clear_cache)=="function" then
-            pcall(ThoughtNativePopup.clear_cache)
-        end
-        if value.cancelled then
-            self:info("迁移已停止。已完成的章节会保留，下次可继续。")
-        elseif value.ok then
-            self:info("迁移完成。\n\n已处理 "..tostring(value.processed or 0).." 个章节、新迁移 "
-                ..tostring(value.comments or 0).." 条评论。以后将直接使用 SQLite。")
-        else
-            self:info("部分章节迁移失败，成功数据已保留，可稍后继续迁移。")
-        end
-    end,900)
-    if not started then
-        self:_close_migration_progress(token)
-        self:info("无法开始迁移：\n"..tostring(err or "未知原因"))
-        return false
-    end
-    return true
-end
-
-function Plugin:_show_book_repair_prompt(context,report)
-    if self._repair_prompt_open then return end
-    self._repair_prompt_open=true
-    local book_id=tostring(report and report.book_id or ((context.book or {}).book_id or ""))
-    local signature=tostring(report and report.signature or self.book_repair:signature(context))
-    local dialog
-    dialog=ButtonDialog:new{title=self:_repair_message(report),title_align="center",buttons={
-        {{text="立即迁移",callback=function()
-            UIManager:close(dialog); self._repair_prompt_open=false
-            self:_run_book_repair(context,report,false)
-        end}},
-        {{text="稍后处理",callback=function()
-            UIManager:close(dialog); self._repair_prompt_open=false
-        end}},
-        {{text="本书不再自动提示",callback=function()
-            UIManager:close(dialog); self._repair_prompt_open=false
-            self:_save_repair_state(book_id,{signature=signature,status="ignored",checked_at=os.time()})
-        end}},
-    }}
-    UIManager:show(dialog)
-end
-
-function Plugin:_schedule_current_book_repair_check(current,urgent)
-    local prefs=self:_repair_preferences()
-    if prefs.auto_check==false then return false end
-    local context=self:_repair_context(current)
-    if not context or not context.book then return false end
-    local book_id=tostring((context.book or {}).book_id or (context.book or {}).bookId or "")
-    if book_id=="" then return false end
-    local previous=self:_repair_state()[book_id]
-    if urgent~=true and type(previous)=="table"
-        and (previous.status=="ok" or previous.status=="fixed" or previous.status=="ignored")
-        and os.time()-(tonumber(previous.checked_at) or 0)<7*24*60*60 then
-        return false
-    end
-    if self.repair_async and self.repair_async:busy() then return false end
-    local repair=self.book_repair
-    local delay=urgent==true and .05 or 1.4
-    UIManager:scheduleIn(delay,function()
-        local active=self:_current_document_path()
-        if tostring(active or "")~=tostring(context.path or "") then return end
-        if self.repair_async:busy() then return end
-        local started=self.repair_async:run("book-migration-check",function()
-            return repair:inspect(context)
-        end,function(result)
-            if not result or result.ok~=true or type(result.value)~="table" then return end
-            local report=result.value
-            if tostring(self:_current_document_path() or "")~=tostring(context.path or "") then return end
-            if #(report.issues or {})==0 then
-                self:_save_repair_state(book_id,{signature=report.signature,status="ok",checked_at=os.time()})
-                return
-            end
-            local row=self:_repair_state()[book_id]
-            if urgent~=true and type(row)=="table" and tostring(row.signature or "")==tostring(report.signature or "")
-                and row.status=="ignored" then return end
-            self:_show_book_repair_prompt(context,report)
-        end,120)
-        if not started then logger.dbg("[SoweRead][Migration] check deferred") end
-    end)
-    return true
-end
-
-function Plugin:_repair_partial_download(book_id,repair,confirmed)
-    local id=tostring(book_id or "")
-    if id=="" or type(repair)~="table" then self:info("没有找到可继续修复的下载断点") return false end
-    self.store:reload()
-    local stored=self.store:book(id)
-    if not stored then self:info("这本书的下载记录已经不存在") return false end
-    if type(repair.options)~="table" then
-        self:info("这个旧下载断点缺少必要信息，无法安全地只补缺失内容。\n\n现有缓存没有删除，可以保留后重新下载。")
-        return false
-    end
-    local title=tostring(stored.title or "本书")
-    if confirmed~=true then
-        local progress=""
-        if tonumber(repair.total or 0)>0 then
-            progress="\n\n已完成 "..tostring(repair.complete or 0).." / "..tostring(repair.total).." 个章节"
-            if tonumber(repair.failed or 0)>0 then progress=progress.."，仍有 "..tostring(repair.failed).." 个章节待补" end
-        end
-        UIManager:show(ConfirmBox:new{
-            text="《"..title.."》存在未完成下载。"..progress
-                .."\n\n修复时会复用现有断点，只重新获取缺失内容；新文件验证成功前不会替换原文件。",
-            ok_text="开始修复",cancel_text="取消",
-            ok_callback=function() self:_repair_partial_download(id,repair,true) end,
-        })
-        return true
-    end
-    if self.download_task and self.download_task:busy() then
-        self:info("已有下载或修复任务正在进行，请完成后再试。")
-        return false
-    end
-    local book={bookId=id,title=stored.title,author=stored.author,cover=stored.cover}
-    local options=U.copy(repair.options)
-    options.repair_only=true
-    options.repair_source="partial_cache"
-    self:status_toast("修复书籍","正在复用断点并补全缺失内容",4)
-    return self:download(book,options,false,function(new_record)
-        self.store:reload()
-        if type(new_record)=="table" and new_record.pending_install==true then
-            self.store:save_session(id,{book_integrity_repaired_at=os.time(),book_integrity_pending_install=true})
-            self:info("修复内容已经生成。\n\n当前正在阅读这本书，新文件会在关闭本书后自动替换；原文件目前没有改变。")
-            self:_notify_home_data_changed("content")
-            return
-        end
-        local remaining=BookIntegrity.partial_repairs(self.store,id)
-        local same_pending=false
-        for _,row in ipairs(remaining) do
-            if tostring(row.root or "")==tostring(repair.root or "") then same_pending=true break end
-        end
-        if same_pending then
-            self.store:save_session(id,{book_integrity_error="partial_pending",book_integrity_checked_at=os.time()})
-            self:info("书籍仍有未完成内容。\n\n已完成章节和下载断点继续保留，下次使用“修复书籍”会从现有进度继续。")
-        else
-            self.store:save_session(id,{book_integrity_repaired_at=os.time(),book_integrity_error=false})
-            local reused=tonumber(repair.complete or 0) or 0
-            local suffix=reused>0 and ("\n\n已复用 "..tostring(reused).." 个已完成章节，没有重新下载整本书。") or ""
-            self:info("书籍修复完成。\n\n缺失内容已经补全，新文件通过检查后才替换原文件。"..suffix)
-        end
-        self:_notify_home_data_changed("content")
-    end,false)
-end
-
-function Plugin:_repair_downloaded_book(book_ref,confirmed)
-    local id=tostring(type(book_ref)=="table" and (book_ref.bookId or book_ref.book_id) or book_ref or "")
-    if id=="" then self:info("没有找到可修复的书籍") return false end
-    self.store:reload()
-    local stored=self.store:book(id)
-    if not stored then self:info("这本书还没有可修复的下载记录") return false end
-
-    local partials=BookIntegrity.partial_repairs(self.store,id)
-    if #partials==1 then return self:_repair_partial_download(id,partials[1],confirmed) end
-    if #partials>1 then
-        local rows={}
-        for _,candidate in ipairs(partials) do
-            local repair=candidate
-            local detail=tonumber(repair.total or 0)>0
-                and (tostring(repair.complete or 0).."/"..tostring(repair.total).." 章已完成") or "可继续修复"
-            rows[#rows+1]={text=repair.label or "未完成缓存",post_text=detail,
-                callback=function() self:_repair_partial_download(id,repair) end}
-        end
-        self:list("选择要修复的未完成下载",rows)
-        return true
-    end
-
-    local record=self:_preferred_record(id)
-    if not record then self:info("这本书还没有可修复的已下载版本") return false end
-    local report=BookIntegrity.inspect(self.store,id,record)
-    if report.repair_kind=="none" then
-        local session=self.store:session(id) or {}
-        if session.sync_repair_required==true then
-            self:info("书籍内容完整。\n\n当前异常来自阅读同步，请打开这本书后使用“修复同步”。")
-        else
-            self:info("检查完成，没有发现需要修复的书籍内容或批注。")
-        end
-        return true
-    end
-    local annotations_only=report.repair_kind=="annotations"
-    local title=tostring(stored.title or record.title or "本书")
-    if confirmed~=true then
-        local text
-        if annotations_only then
-            text="《"..title.."》正文已经生成，但部分划线与想法未完整下载。\n\n修复时只补缺失内容，已完成正文和阅读位置会保留。"
-        else
-            text="《"..title.."》的书籍内容或章节映射需要修复。\n\n将优先使用现有断点，只补缺失内容；新文件验证成功前不会替换原文件。"
-        end
-        UIManager:show(ConfirmBox:new{
-            text=text,ok_text="开始修复",cancel_text="取消",
-            ok_callback=function() self:_repair_downloaded_book(id,true) end,
-        })
-        return true
-    end
-    if self.download_task and self.download_task:busy() then
-        self:info("已有下载或修复任务正在进行，请完成后再试。")
-        return false
-    end
-    local book={bookId=id,title=stored.title or record.title,author=stored.author or record.author,cover=stored.cover}
-    local options=BookIntegrity.repair_options(record)
-    self:status_toast("修复书籍",annotations_only and "正在补全缺失的划线与想法" or "正在检查并补全书籍内容",4)
-    return self:download(book,options,false,function(new_record)
-        self.store:reload()
-        if type(new_record)=="table" and new_record.pending_install==true then
-            self.store:save_session(id,{book_integrity_repaired_at=os.time(),book_integrity_pending_install=true})
-            self:info("修复内容已经生成。\n\n当前正在阅读这本书，新文件会在关闭本书后自动替换；替换后阅读同步会重新验证。")
-            self:_notify_home_data_changed("content")
-            return
-        end
-        local refreshed=self:_preferred_record(id) or new_record
-        local checked=BookIntegrity.inspect(self.store,id,refreshed)
-        if checked.repair_kind=="none" then
-            self.store:save_session(id,{book_integrity_repaired_at=os.time(),book_integrity_error=false})
-            local session=self.store:session(id) or {}
-            local extra=session.sync_repair_required==true and "\n\n书籍已修复。阅读同步仍需在打开本书后重新验证。" or ""
-            self:info((annotations_only and "书籍修复完成。\n\n已补全缺失的划线与想法，正文和阅读位置未重新下载。"
-                or "书籍修复完成。\n\n缺失内容已补全，新文件已经通过检查。")..extra)
-        else
-            self.store:save_session(id,{book_integrity_error=checked.error or checked.repair_kind,book_integrity_checked_at=os.time()})
-            self:info("书籍仍有未完成内容：\n"..tostring(checked.error or (checked.annotation_pending and "部分划线与想法仍待修复" or "完整性检查未通过")))
-        end
-        self:_notify_home_data_changed("content")
-    end,false)
-end
-
-function Plugin:repair_current_book()
-    local current=self:_current_book_record()
-    if not current or not current.book then self:info("请先打开一本轻松读书籍") return false end
-    return self:_repair_downloaded_book(current.book.book_id)
-end
-
-function Plugin:check_and_repair_current()
-    local current=self:_current_book_record()
-    if not current or not current.book then self:info("请先打开一本轻松读书籍") return false end
-    local id=tostring(current.book.book_id or current.book.bookId or "")
-    if id=="" then self:info("当前书籍无法识别") return false end
-
-    self.store:reload()
-    local partials=BookIntegrity.partial_repairs(self.store,id)
-    local record=self:_preferred_record(id) or current.record
-    local report=record and BookIntegrity.inspect(self.store,id,record) or nil
-    if #partials>0 or (report and report.repair_kind~="none") then
-        return self:_repair_downloaded_book(id)
-    end
-
-    local session=self.store:session(id) or {}
-    local repair_kind=tostring(session.sync_repair_kind or "")
-    if session.sync_repair_required==true and (repair_kind=="context" or repair_kind=="position") then
-        return self:repair_current_sync()
-    end
-
-    if self.sync:is_current_verified() then
-        if report and report.annotation_unresolved==true then
-            self:info("检查完成。\n\n书籍内容和阅读同步正常。少量旧批注无法可靠恢复，已保留现状，不会因此反复要求修复。")
-        else
-            self:info("检查完成。\n\n书籍内容、批注和阅读同步都正常，无需修复。")
-        end
-        return true
-    end
-
-    self:status_toast("检查与修复","书籍内容正常，正在核对阅读位置",3)
-    return self:manual_sync()
-end
-
-function Plugin:scan_downloaded_books_for_integrity_repair()
-    self.store:reload()
-    local rows={}
-    for _,book in ipairs(self.store:all_books()) do
-        local id=tostring(book.book_id or book.bookId or "")
-        if id~="" then
-            local partials=BookIntegrity.partial_repairs(self.store,id)
-            local record=self:_preferred_record(id)
-            local book_id=id
-            if #partials>0 then
-                rows[#rows+1]={text=tostring(book.title or (record and record.title) or id),
-                    post_text=tostring(#partials).." 个未完成断点",
-                    callback=function() self:_repair_downloaded_book(book_id) end}
-            elseif record then
-                local report=BookIntegrity.inspect(self.store,id,record)
-                if report.repair_kind~="none" then
-                    local label=report.repair_kind=="annotations" and "批注待修复" or "书籍待修复"
-                    rows[#rows+1]={text=tostring(book.title or record.title or id),post_text=label,
-                        callback=function() self:_repair_downloaded_book(book_id) end}
-                end
-            end
-        end
-    end
-    if #rows==0 then self:info("检查完成，没有发现需要修复的已下载书籍或未完成下载。") return true end
-    self:list("需要修复的书籍 · "..tostring(#rows).." 本",rows)
-    return true
-end
-
-function Plugin:migrate_current_book_comments(confirmed)
-    local context=self:_repair_context()
-    if not context then self:info("请先打开一本轻松读书籍"); return end
-    if confirmed~=true and self:_active_reader_ui() and self:_notice_enabled("repair_while_reading") then
-        local dialog
-        dialog=ButtonDialog:new{title="迁移会读取本书旧评论数据。大书可能短暂变慢，但不会重新下载正文。",title_align="center",buttons={
-            {{text="继续迁移",callback=function() UIManager:close(dialog); self:migrate_current_book_comments(true) end}},
-            {{text="继续并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("repair_while_reading",false); self:migrate_current_book_comments(true) end}},
-            {{text="稍后处理",callback=function() UIManager:close(dialog) end}},
-        }}
-        UIManager:show(dialog)
-        return
-    end
-    self:_run_book_repair(context,nil,true)
-end
-
-function Plugin:scan_downloaded_books_for_repair(confirmed)
-    if confirmed~=true and self:_notice_enabled("library_scan") then
-        self:_confirm_library_scan(function() self:scan_downloaded_books_for_repair(true) end)
-        return
-    end
-    if self.repair_async:busy() then self:toast("已有检查或迁移任务正在进行"); return end
-    self:toast("正在检查已下载书籍",2)
-    local repair=self.book_repair
-    local started,err=self.repair_async:run("scan-book-migration",function()
-        return repair:scan_downloaded()
-    end,function(result)
-        if not result or result.ok~=true or type(result.value)~="table" then
-            self:info("检查失败：\n"..tostring(result and result.error or "未知原因")); return
-        end
-        local scan=result.value
-        if tonumber(scan.affected or 0)==0 then
-            self:info("检查完成，没有发现需要迁移的已下载书籍。")
-            return
-        end
-        UIManager:show(ConfirmBox:new{
-            text="发现 "..tostring(scan.affected).." 本书仍有旧版评论数据。\n\n是否全部迁移到 SQLite？",
-            ok_text="全部迁移",cancel_text="暂不处理",
-            ok_callback=function()
-                if self.repair_async:busy() then self:toast("已有迁移任务正在进行"); return end
-                local token="migration-batch-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))
-                local path=DownloadDatabase.runtime_path(self.store)
-                DownloadDatabase.clear_task(path,token)
-                self:_schedule_migration_progress(token,"已下载书籍评论")
-                local ok_start,error_start=self.repair_async:run("migrate-downloaded-books",function()
-                    local output={checked=0,migrated=0,failed=0,cancelled=false,details={},groups=0,comments=0}
-                    local total_chapters=0
-                    for _,row in ipairs(scan.contexts or {}) do
-                        total_chapters=total_chapters+#((row.report or {}).files or {})
-                    end
-                    local completed=0
-                    for _,row in ipairs(scan.contexts or {}) do
-                        if DownloadDatabase.is_cancelled(path,token) then output.cancelled=true; break end
-                        local book_title=tostring(((row.context or {}).book or {}).title or (row.context or {}).title or "书籍")
-                        local value=repair:migrate(row.context,row.report,{
-                            archive_legacy=false,
-                            cancelled=function() return DownloadDatabase.is_cancelled(path,token) end,
-                            progress=function(state)
-                                state=type(state)=="table" and state or {}
-                                DownloadDatabase.set_task_value(path,token,"migration_progress",{
-                                    current=completed+(tonumber(state.current) or 0),
-                                    total=total_chapters,
-                                    chapter=book_title.." · "..tostring(state.chapter or ""),
-                                    groups=output.groups+(tonumber(state.groups) or 0),
-                                    comments=output.comments+(tonumber(state.comments) or 0),
-                                    percent=total_chapters>0 and (completed+(tonumber(state.current) or 0))/total_chapters or 1,
-                                })
-                            end,
-                        })
-                        output.checked=output.checked+1
-                        output.groups=output.groups+(tonumber(value.groups) or 0)
-                        output.comments=output.comments+(tonumber(value.comments) or 0)
-                        completed=completed+#((row.report or {}).files or {})
-                        if value.cancelled then output.cancelled=true end
-                        if value.ok then output.migrated=output.migrated+1 else output.failed=output.failed+1 end
-                        output.details[#output.details+1]=value
-                        if output.cancelled then break end
-                    end
-                    output.ok=output.failed==0 and output.cancelled~=true
-                    return output
-                end,function(fixed)
-                    self:_close_migration_progress(token)
-                    if not fixed or fixed.ok~=true or type(fixed.value)~="table" then
-                        self:info("批量迁移失败：\n"..tostring(fixed and fixed.error or "未知原因")); return
-                    end
-                    local value=fixed.value
-                    local status=value.cancelled and "已停止" or (value.ok and "已完成" or "部分失败")
-                    self:_record_repair_history({title="批量迁移",book_id=""},status)
-                    if value.cancelled then
-                        self:info("批量迁移已停止。已完成的数据会保留，下次可继续。")
-                    elseif value.ok then
-                        self:info("全部迁移完成。\n\n新迁移 "..tostring(value.comments or 0).." 条评论。")
-                    else
-                        self:info("部分书籍迁移失败，可稍后重试。")
-                    end
-                end,1800)
-                if not ok_start then
-                    self:_close_migration_progress(token)
-                    self:info("无法开始批量迁移：\n"..tostring(error_start or "未知原因"))
-                end
-            end,
-        })
-    end,240)
-    if not started then self:info("无法开始检查：\n"..tostring(err or "未知原因")) end
-end
-
-function Plugin:clear_invalid_comment_indexes()
-    if self.repair_async:busy() then self:toast("已有检查或迁移任务正在进行"); return end
-    local repair=self.book_repair
-    local started,err=self.repair_async:run("clear-legacy-comment-data",function()
-        return repair:remove_verified_legacy_downloaded()
-    end,function(result)
-        if result and result.ok==true then
-            self:info("已清理 "..tostring(result.value or 0).." 本书的旧 JSON 备份。SQLite 数据不会受到影响。")
-        else
-            self:info("清理失败：\n"..tostring(result and result.error or "未知原因"))
-        end
-    end,300)
-    if not started then self:info("无法开始清理：\n"..tostring(err or "未知原因")) end
-end
-
-function Plugin:show_repair_history()
-    local history=self.store:get("book_repair_history",{})
-    local items={}
-    for _,row in ipairs(type(history)=="table" and history or {}) do
-        items[#items+1]={text=tostring(row.title or "书籍"),
-            post_text=self:_display_time("%m-%d %H:%M",tonumber(row.at) or os.time()).." · "..tostring(row.status or ""),enabled=false}
-    end
-    if #items==0 then items[1]={text="还没有迁移记录",enabled=false} end
-    self:list("迁移记录",items)
-end
-
-function Plugin:_confirm_library_scan(callback)
-    if not self:_notice_enabled("library_scan") then callback(); return true end
-    local dialog
-    dialog=ButtonDialog:new{title="扫描大量本地书籍可能暂时增加耗电，并使主页响应变慢。",title_align="center",buttons={
-        {{text="开始扫描",callback=function() UIManager:close(dialog); callback() end}},
-        {{text="开始并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("library_scan",false); callback() end}},
-        {{text="取消",callback=function() UIManager:close(dialog) end}},
-    }}
-    UIManager:show(dialog)
-    return true
-end
-
-function Plugin:book_repair_settings_menu()
-    return {
-        {text="打开书籍时检查旧评论数据",checked_func=function()
-            return (self.store:preferences().repair or {}).auto_check~=false
-        end,keep_menu_open=true,callback=function()
-            local p=self.store:preferences(); p.repair=p.repair or {}
-            p.repair.auto_check=p.repair.auto_check==false
-            self.store:save_preferences(p)
-        end},
-        {text="迁移当前书籍评论",callback=function() self:migrate_current_book_comments() end},
-        {text="扫描所有待迁移书籍",callback=function() self:scan_downloaded_books_for_repair() end},
-        {text="重新扫描本地书籍与封面",callback=function() self:show_soweread_home(true) end},
-        {text="清理已验证的旧 JSON 备份",callback=function() self:clear_invalid_comment_indexes() end},
-        {text="迁移记录",callback=function() self:show_repair_history() end},
-        {text="重置迁移提示状态",callback=function()
-            self.store:set("book_repair_state",{})
-            self:toast("已重置评论迁移提示状态")
-        end},
-    }
-end
-
 function Plugin:_toggle_preference(key)
     local p=self.store:preferences(); p[key]=not p[key]; self.store:save_preferences(p)
 end
 
 
 
-
-function Plugin:_thought_display_label()
-    return self:_thoughts_enabled() and ("已开启 · "..self:_thought_font_size_label()) or "已关闭"
-end
 
 function Plugin:_toggle_home_network_metadata()
     local home,preferences=self:_home_preferences()
@@ -17714,7 +16371,6 @@ function Plugin:display_settings_menu()
         {text="轻松读界面字体",post_text=self:_home_ui_font_label(home),sub_item_table_func=function() return self:home_ui_font_menu() end},
         {text="首页书架来源",post_text="选择显示项目",sub_item_table_func=function() return self:home_source_settings_menu() end},
         {text="本地书籍",post_text=home.local_auto_update==true and "自动更新" or "手动更新",sub_item_table_func=function() return self:local_library_settings_menu() end},
-        {text="公众号阅读",post_text="图片与缓存",sub_item_table_func=function() return self:mp_settings_menu() end},
         {text="主页快捷工具",post_text="最多六项",sub_item_table_func=function() return self:home_action_settings_menu() end},
         {text="下滑工具栏",post_text="设备与 KOReader",sub_item_table_func=function() return self:home_panel_settings_menu() end},
         {text="网络补全图书信息",post_text="只补充缺失资料",checked_func=function() return self:_home_preferences().network_metadata~=false end,keep_menu_open=true,callback=function() self:_toggle_home_network_metadata() end},
@@ -17912,12 +16568,6 @@ function Plugin:download_settings_menu()
     items[#items+1]={text="存储清理",post_text="临时文件与失效封面",callback=function() self:show_download_cleanup_dialog() end}
     return items
 end
-function Plugin:mp_settings_menu()
-    return {
-        {text="下载文章图片",checked_func=function() return self.store:preferences().mp_images==true end,keep_menu_open=true,callback=function() self:_toggle_preference("mp_images") end},
-        {text="公众号缓存管理",sub_item_table_func=function() return self:mp_global_cache_menu() end},
-    }
-end
 function Plugin:account_sync_settings_menu()
     -- Keep desktop mode and plugin mode on the same settings source.  beta.7
     -- had a second desktop-only menu here, so the annotation-sync controls
@@ -17928,7 +16578,6 @@ end
 function Plugin:more_settings_menu()
     return {
         {text="提醒与确认",sub_item_table_func=function() return self:notice_settings_menu() end},
-        {text="评论数据迁移",sub_item_table_func=function() return self:book_repair_settings_menu() end},
         {text="更新设置",sub_item_table_func=function() return self:update_settings_menu() end},
         {text="关于轻松读",callback=self:safe("about",function() self:show_about() end)},
     }
@@ -17954,48 +16603,17 @@ function Plugin:settings_menu()
         rows[#rows+1]={text="首页与书架",post_text="布局 书架与快捷入口",sub_item_table_func=function() return self:display_settings_menu() end}
         rows[#rows+1]={text="阅读界面",post_text="显示与快捷控制",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end}
     end
-    rows[#rows+1]={text="评论 划线与想法",post_text=self:_thought_display_label(),sub_item_table_func=function() return PluginSettings.comments(self) end}
     rows[#rows+1]={text="本地书库",post_text=(self:_home_preferences().local_auto_update==true and "自动更新" or "手动更新"),sub_item_table_func=function() return self:local_library_settings_menu() end}
     rows[#rows+1]={text="账户",post_text=self:logged_in() and "已登录" or "未登录",callback=function() self:show_account_status() end}
     rows[#rows+1]={text="阅读同步",post_text=self:_home_sync_status_label(),sub_item_table_func=function() return self:sync_settings_menu() end}
     rows[#rows+1]={text="下载管理",post_text=self:_download_menu_text(),callback=function() self:show_downloads() end}
     rows[#rows+1]={text="时间与时区",post_text=TimeZone.label((self:_time_preferences())),sub_item_table_func=function() return self:time_display_settings_menu() end}
     rows[#rows+1]={text="性能与兼容性",post_text=self:_performance_mode_label(),sub_item_table_func=function() return self:performance_settings_menu() end}
-    rows[#rows+1]={text="公众号阅读",sub_item_table_func=function() return self:mp_settings_menu() end}
     rows[#rows+1]={text="更新与关于",sub_item_table_func=function() return PluginSettings.update_about(self) end}
     rows[#rows+1]={text="工具与维护",sub_item_table_func=function() return self:maintenance_menu() end}
     return rows
 end
 
-function Plugin:thought_font_settings_menu()
-    local prefs=self.store:preferences().thoughts or {}
-    return {
-        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-        {text="评论字体跟随正文",checked_func=function()
-            return (self.store:preferences().thoughts or {}).follow_body_font==true
-        end,keep_menu_open=true,callback=function()
-            local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-            p.thoughts.follow_body_font=p.thoughts.follow_body_font~=true
-            self.store:save_preferences(p)
-            self:_refresh_thought_display(p.thoughts)
-            if p.thoughts.follow_body_font then
-                self:toast("评论字体将跟随正文")
-            else
-                self:toast("评论字体已改为固定字体")
-            end
-        end},
-        {text="固定字体",post_text=self:_thought_font_face_label(prefs),enabled_func=function()
-            return (self.store:preferences().thoughts or {}).follow_body_font~=true
-        end,sub_item_table_func=function() return self:thought_font_face_menu() end},
-        {text="字体大小",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_menu() end},
-    }
-end
-
-function Plugin:_thought_font_face_label(prefs)
-    prefs=prefs or (self.store:preferences().thoughts or {})
-    local name=U.trim(tostring(prefs.font_face or ""))
-    return name~="" and name or "KOReader 默认"
-end
 function Plugin:_reader_font_face_choices()
     local choices={}
     local seen={}
@@ -18038,61 +16656,6 @@ function Plugin:_reader_font_face_choices()
     return choices
 end
 
-function Plugin:thought_font_face_menu()
-    local rows={
-        {text="KOReader 默认字体",radio=true,menu_item_id="__default__",checked_func=function()
-            return U.trim(tostring((self.store:preferences().thoughts or {}).font_face or ""))==""
-        end,callback=function()
-            local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-            p.thoughts.font_face=""; p.thoughts.follow_body_font=false
-            self.store:save_preferences(p)
-            self:_refresh_thought_display(p.thoughts)
-            self:toast("评论字体已设为 KOReader 默认字体")
-        end},
-    }
-    local choices=self:_reader_font_face_choices()
-    if #choices==0 then
-        rows[#rows+1]={text="无法读取正文字体列表",enabled=false}
-        return rows
-    end
-    for _,choice in ipairs(choices) do
-        local selected=choice.name
-        rows[#rows+1]={
-            text=choice.label,
-            font_func=choice.font_func,
-            radio=true,
-            menu_item_id=selected,
-            checked_func=function()
-                return tostring((self.store:preferences().thoughts or {}).font_face or "")==selected
-            end,
-            callback=function()
-                local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-                p.thoughts.font_face=selected; p.thoughts.follow_body_font=false
-                self.store:save_preferences(p)
-                self:_refresh_thought_display(p.thoughts)
-                self:toast("评论字体已设为："..selected)
-            end,
-        }
-    end
-    rows.max_per_page=5
-    rows.open_on_menu_item_id_func=function()
-        local face=U.trim(tostring((self.store:preferences().thoughts or {}).font_face or ""))
-        return face~="" and face or "__default__"
-    end
-    return rows
-end
-function Plugin:thought_font_menu()
-    local choices={18,22,26,30}
-    local rows={}
-    for _,value in ipairs(choices) do
-        local target=value
-        rows[#rows+1]={text=tostring(target),radio=true,checked_func=function() return self:_thought_font_size_value()==target end,callback=function()
-            self:_set_thought_font_size(target)
-        end}
-    end
-    rows[#rows+1]={text="阅读界面可用 − / + 精细调整",enabled=false}
-    return rows
-end
 
 function Plugin:_download_dir_path()
     local custom=U.trim((self.store:preferences() or {}).download_dir or "")
@@ -18514,74 +17077,6 @@ function Plugin:_teardown_thought_tap()
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="soweread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
 end
-function Plugin:_thought_font_size(value)
-    -- The native comment popup uses this same final size for layout metrics and
-    -- glyph rendering. The popup explicitly uses ThoughtFaceFactory:getFinalFace()
-    -- so the device scale is applied exactly once. UI preview callers stay logical.
-    local logical
-    if tonumber(value) then logical=math.max(12,math.min(48,math.floor(tonumber(value)+.5)))
-    else
-        local legacy={small=18,standard=22,large=26,xlarge=30}
-        logical=legacy[tostring(value or "standard")] or 22
-    end
-    local scaled=logical
-    if Device and Device.screen and type(Device.screen.scaleBySize)=="function" then
-        local ok,result=pcall(Device.screen.scaleBySize,Device.screen,logical)
-        if ok and tonumber(result) then scaled=math.max(logical,math.floor(tonumber(result)+.5)) end
-    end
-    return scaled
-end
-
-local function usable_font_name(value)
-    if type(value)~="string" then return nil end
-    value=value:match("^%s*(.-)%s*$")
-    if value=="" then return nil end
-    return value
-end
-function Plugin:_thought_font_name(prefs)
-    prefs=prefs or (self.store:preferences().thoughts or {})
-    if prefs.follow_body_font~=true then
-        return usable_font_name(prefs.font_face)
-    end
-    local doc=self.ui and self.ui.document
-    if doc and type(doc.getFontFace)=="function" then
-        local ok,value=pcall(doc.getFontFace,doc)
-        if ok then
-            name=usable_font_name(value)
-            if name then return name end
-        end
-    end
-
-    local name=usable_font_name(self.ui and self.ui.font and self.ui.font.font_face)
-    if name then return name end
-
-    if _G.G_reader_settings and type(_G.G_reader_settings.readSetting)=="function" then
-        local ok,value=pcall(_G.G_reader_settings.readSetting,_G.G_reader_settings,"cre_font")
-        if ok then return usable_font_name(value) end
-    end
-    return nil
-end
-function Plugin:_write_thought_popup_marker(stage, info, extra)
-    local path=tostring(self._thought_popup_marker_path or "")
-    if path=="" then return false end
-    local payload={
-        version=tostring(self.version or Config.VERSION),
-        stage=tostring(stage or "unknown"),
-        timestamp=os.time(),
-        book_id=info and tostring(info.book_id or "") or nil,
-        chapter_uid=info and tostring(info.chapter_uid or "") or nil,
-        range=info and tostring(info.range or "") or nil,
-    }
-    for key,value in pairs(type(extra)=="table" and extra or {}) do payload[key]=value end
-    local ok,encoded=pcall(Json.encode,payload)
-    if not ok then return false end
-    return U.atomic_write(path,encoded,true)==true
-end
-
-function Plugin:_clear_thought_popup_marker()
-    local path=tostring(self._thought_popup_marker_path or "")
-    if path~="" then os.remove(path) end
-end
 
 function Plugin:_flush_reader_checkpoint(reason, force)
     if not (self.ui and self.ui.document) then return false end
@@ -18632,184 +17127,6 @@ function Plugin:_schedule_reader_checkpoint(reason, delay)
     return true
 end
 
-function Plugin:_finish_thought_popup(generation)
-    if generation and generation~=self._thought_popup_generation then return end
-    self._thought_popup=nil
-    self._thought_popup_busy=false
-    self:_clear_thought_popup_marker()
-    if self.download_task then self.download_task:resume("thought_popup") end
-    self:_mark_reader_busy(2)
-    if self._performance_prompt_pending then
-        UIManager:scheduleIn(.45,function() self:_show_performance_prompt() end)
-    end
-    UIManager:scheduleIn(1.2,function() collectgarbage("step",48) end)
-end
-
-function Plugin:_close_active_thought_popup(reason)
-    local popup=self._thought_popup
-    self._thought_popup_generation=(tonumber(self._thought_popup_generation) or 0)+1
-    self._thought_popup=nil
-    self._thought_popup_busy=false
-    self:_clear_thought_popup_marker()
-    if self.download_task then self.download_task:resume("thought_popup") end
-    if popup and popup~=true then
-        pcall(UIManager.close,UIManager,popup)
-        logger.info("[SoweRead][ThoughtPopup] closed","reason=",tostring(reason or "forced"))
-    end
-end
-
-function Plugin:_open_thought_info(info,generation)
-    if generation~=self._thought_popup_generation or not (self.ui and self.ui.document) then
-        self:_finish_thought_popup(generation)
-        return
-    end
-    local started=monotonic_wall_time()
-    local popup,notice
-    local ok,unexpected=xpcall(function()
-        -- The tap marker already proves a popup was active if KOReader exits
-        -- abnormally. Keep intermediate stages in the log instead of rewriting
-        -- the same flash file several times during one visible tap.
-        local lookup_started=monotonic_wall_time()
-        local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
-        local lookup_ms=math.floor((monotonic_wall_time()-lookup_started)*1000+.5)
-        if not group then notice=tostring(err or "没有想法内容"); return end
-        local prefs=self.store:preferences().thoughts or {}
-        local function on_close() self:_finish_thought_popup(generation) end
-        local parts_started=monotonic_wall_time()
-        local source,comments,count,native_cache_hit,native_signature=Thoughts.native_parts_cached(
-            self.store,info.book_id,info.chapter_uid,info.range,group,token
-        )
-        local parts_ms=math.floor((monotonic_wall_time()-parts_started)*1000+.5)
-        if tostring(source or "")=="" and #(comments or {})==0 then notice="没有想法内容"; return end
-        local show_started=monotonic_wall_time()
-        popup=ThoughtNativePopup.show{
-            source_text=source,
-            comments=comments,
-            cache_key=table.concat({
-                tostring(info.book_id or ""), tostring(info.chapter_uid or ""),
-                tostring(info.range or ""), tostring(native_signature or ""),
-            }, "|"),
-            font_size=self:_thought_font_size(self:_thought_font_size_value(prefs)),
-            font_name=self:_thought_font_name(prefs),
-            width_ratio=tonumber(prefs.width_ratio) or 0.91,
-            height_ratio=tonumber(prefs.height_ratio) or 0.55,
-            on_close=on_close,
-            on_interact=function() self:_mark_reader_busy(30) end,
-            on_error=function()
-                self:info("评论显示失败，窗口已安全关闭。当前阅读位置不会丢失。")
-            end,
-        }
-        local show_ms=math.floor((monotonic_wall_time()-show_started)*1000+.5)
-        local elapsed_ms=math.floor((monotonic_wall_time()-started)*1000+.5)
-        logger.info("[SoweRead][ThoughtPopup] opened",
-            "mode=","native_rounded_paged_swipe",
-            "book=",tostring(info.book_id),"chapter=",tostring(info.chapter_uid),
-            "comments=",tostring(count or 0),
-            "source=",token and token.index_hit and "compact_index" or "chapter_cache",
-            "cache=",token and token.cache_hit and "hit" or "miss",
-            "native_cache=",native_cache_hit and "hit" or "miss",
-            "lookup_ms=",tostring(lookup_ms),
-            "parts_ms=",tostring(parts_ms),
-            "show_ms=",tostring(show_ms),
-            "elapsed_ms=",tostring(elapsed_ms))
-        if not popup then error("评论窗口未能加入界面") end
-        self._thought_popup=popup
-        self:_record_performance("thought_popup",elapsed_ms)
-        if token and token.index_hit~=true then
-            UIManager:scheduleIn(.2,function() self:_schedule_current_book_repair_check(nil,true) end)
-        end
-    end,debug.traceback)
-    if not ok then
-        logger.err("[SoweRead][ThoughtPopup] open failed",tostring(unexpected))
-        self:_finish_thought_popup(generation)
-        self:info("评论暂时无法显示。当前阅读批注已先保存，请稍后重试。")
-    elseif not popup then
-        self:_finish_thought_popup(generation)
-        if notice then self:info(notice) end
-    end
-end
-
-function Plugin:_show_thought_href(href)
-    local info=Thoughts.parse_href(href); if not info then return false end
-    -- A disabled comment layer still owns its internal links. Consume them
-    -- silently instead of letting KOReader report #miuthought as invalid.
-    if not self:_thoughts_enabled() then return true end
-    if self._thought_popup_busy or self._thought_popup then return true end
-    local runtime=self._download_runtime
-    if runtime and self.download_task and self.download_task:busy() and runtime.comment_slow_notice~=true then
-        runtime.comment_slow_notice=true
-        self:status_toast("后台正在下载","评论打开和翻页可能稍慢",3)
-    end
-    self._thought_popup_generation=(tonumber(self._thought_popup_generation) or 0)+1
-    local generation=self._thought_popup_generation
-    self._thought_popup_busy=true
-    self:_write_thought_popup_marker("tap",info)
-    if self.download_task then self.download_task:pause("thought_popup") end
-    self:_mark_reader_busy(30)
-    -- Only write document metadata here when annotations really changed.
-    -- Repeatedly opening comments must not force a storage flush every time.
-    if self._reader_checkpoint_dirty and os.time()-(tonumber(self._reader_checkpoint_last) or 0)>=5 then
-        self:_flush_reader_checkpoint("before_thought_popup",false)
-    end
-    UIManager:nextTick(function()
-        self:_open_thought_info(info,generation)
-    end)
-    return true
-end
-
-function Plugin:_thought_edge_page_turn(ges)
-    local enabled,percent=self:_reader_edge_guard_state()
-    if not enabled then return false end
-    local pos=ges and ges.pos
-    local x=pos and tonumber(pos.x)
-    local width=Device.screen and Device.screen:getWidth()
-    if not x or not width or width<=0 then return false end
-
-    local ratio=math.max(.05,math.min(.20,(tonumber(percent) or 10)/100))
-    local inverse=self.ui and self.ui.view and self.ui.view.inverse_reading_order==true
-    local diff
-    if x<=width*ratio then
-        diff=inverse and 1 or -1
-    elseif x>=width*(1-ratio) then
-        diff=inverse and -1 or 1
-    else
-        return false
-    end
-
-    -- Keep KOReader's own tap-turn preference authoritative. The guard only
-    -- resolves a collision between an edge annotation link and a page turn.
-    if _G.G_reader_settings and type(G_reader_settings.nilOrFalse)=="function"
-        and not G_reader_settings:nilOrFalse("page_turns_disable_tap") then
-        return false
-    end
-    if not self.ui or type(self.ui.handleEvent)~="function" then return false end
-
-    local ok,handled=pcall(self.ui.handleEvent,self.ui,Event:new("GotoViewRel",diff))
-    if not ok or handled~=true then return false end
-    self:_mark_reader_busy(2)
-    logger.dbg("[SoweRead][ThoughtPopup] edge annotation tap converted to page turn",
-        "percent=",tostring(percent),"direction=",diff<0 and "backward" or "forward")
-    return true
-end
-
-function Plugin:_on_thought_tap(ges)
-    -- Reader Gesture Manager keeps priority in configured corner regions.
-    -- This prevents the annotation edge guard from turning a corner action
-    -- into a page turn when a comment link happens to sit under that corner.
-    if GestureBridge.dispatch(ges) then return true end
-    if not self.ui or not self.ui.link or not self.ui.link.getLinkFromGes then return false end
-    local ok,link=pcall(self.ui.link.getLinkFromGes,self.ui.link,ges); if not ok or not link then return false end
-    local href=extract_thought_href(link,{},0); if not href then return false end
-    if self:_thought_edge_page_turn(ges) then return true end
-    return self:_show_thought_href(href)
-end
-function Plugin:_setup_thought_tap()
-    if self._thought_tap_setup or not self.ui or not self.ui.registerTouchZones then return end
-    local ok,Device=pcall(require,"device"); if ok and Device.isTouchDevice and not Device:isTouchDevice() then return end
-    self.ui:registerTouchZones({{id="soweread_thought_popup",ges="tap",screen_zone={ratio_x=0,ratio_y=0,ratio_w=1,ratio_h=1},overrides={"tap_link"},handler=function(ges) return self:_on_thought_tap(ges) end}})
-    self._thought_tap_setup=true
-end
-
 function Plugin:_record_recent_read(path,book,record)
     path=normalized_reader_file(path) or tostring(path or "")
     local book_id=tostring((book and (book.book_id or book.bookId))
@@ -18845,17 +17162,11 @@ end
 function Plugin:on_sync_record_ready(current)
     self:_teardown_thought_tap()
     if current and current.book then
-        local book_id,path=tostring(current.book.book_id),current.path
-        local record=current.record or {}
-        local variant=tostring(current.variant or record.variant or "")
-        if record.annotation_requested==true or variant:find("notes",1,true) then
-            self:_setup_thought_tap()
-        end
+        local path=current.path
         -- ReaderReady already records the file immediately in LuaSettings
         -- memory. Once Sync resolves the canonical book id, backfill that id
         -- without a synchronous disk flush or another delayed timer.
         self:_record_recent_read(path,current.book,current.record)
-        self:_schedule_current_book_repair_check(current,false)
     end
     if self.store:preferences().sync.progress_enabled~=false then
         if self.sync:is_current_verified() then
@@ -18909,10 +17220,6 @@ function Plugin:_prepare_reader_disappearance(reason)
         self:_flush_reader_checkpoint(reason or "reader_disappeared",true)
     end
     self:_mark_reader_busy(4)
-    self:_close_active_thought_popup(reason or "reader disappeared")
-    if ThoughtNativePopup and type(ThoughtNativePopup.cleanup)=="function" then
-        pcall(ThoughtNativePopup.cleanup)
-    end
     if self._reader_checkpoint_task then
         UIManager:unschedule(self._reader_checkpoint_task)
         self._reader_checkpoint_task=nil
@@ -19205,45 +17512,9 @@ function Plugin:onReaderReady()
         HOME_SESSION.opening_file=nil
         HOME_SESSION.opening_at=0
         local path=self:_current_document_path()
-        local book,record,variant
         if path then
-            book,record,variant=self.store:identify_file(path,false)
+            local book,record=self.store:identify_file(path,false)
             self:_record_recent_read(path,book,record)
-        end
-        if record and (record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)) then
-            self:_setup_thought_tap()
-            logger.info("[SoweRead][ThoughtPopup] local tap ready before cloud sync")
-        end
-        local pending=HOME_SESSION.pending_annotation_jump
-        if type(pending)=="table" then
-            local age=os.time()-(tonumber(pending.requested_at) or 0)
-            if age<0 or age>45 then
-                HOME_SESSION.pending_annotation_jump=nil
-            else
-                local current_id=book and tostring(book.book_id or book.bookId or "") or ""
-                local same_book=current_id~="" and current_id==tostring(pending.book_id or "")
-                local same_file=normalized_reader_file(path)==normalized_reader_file(pending.source_path)
-                if same_book or same_file then
-                    HOME_SESSION.pending_annotation_jump=nil
-                    UIManager:scheduleIn(.16,function()
-                        if not (self.ui and self.ui.document) or reader_close_active() then return end
-                        self:_reader_goto_annotation(pending)
-                        if pending.manage==true then
-                            UIManager:scheduleIn(.14,function()
-                                local item=self:_annotation_find_reader_item(pending)
-                                if item then
-                                    local kind=self:_reader_annotation_type(item)
-                                    self:_show_reader_annotation_actions(item,kind,nil,function()
-                                        self:_show_reader_records(self:_reader_annotation_type(item) or kind,function() self:show_reader_quick_panel() end)
-                                    end)
-                                else
-                                    self:toast("已跳到批注位置；当前记录暂时无法直接编辑",2)
-                                end
-                            end)
-                        end
-                    end)
-                end
-            end
         end
     end)
     -- Prime only lightweight page/chapter data. No toolbar widget survives a

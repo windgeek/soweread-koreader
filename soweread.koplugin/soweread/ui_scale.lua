@@ -45,7 +45,7 @@ end
 local function text_face(name, size)
     if ui_font_name then
         if not ThoughtFaceFactory then
-            local ok, module = pcall(require, "soweread.thought_face_factory")
+            local ok, module = pcall(require, "soweread.face_factory")
             if ok then ThoughtFaceFactory = module end
         end
         if ThoughtFaceFactory then

@@ -1,7 +1,6 @@
 local bit = require("bit")
 local Json = require("soweread.json")
 local U = require("soweread.util")
-local AnnotationStyle = require("soweread.annotation_style")
 
 local E = {}
 local CHUNK_SIZE = 64 * 1024
@@ -217,9 +216,7 @@ function E.build(path, book, chapters, css, assets, cover, meta)
     }
     local spine, nav, ncx = {}, {}, {}
     local cover_meta = ""
-    local inline_style = tostring(css or ""):find(AnnotationStyle.MARKER_BEGIN, 1, true)
-        and AnnotationStyle.inline_style_tag()
-        or ""
+    local inline_style = ""
 
     if cover and (cover.data or cover.data_path or cover.path) then
         entries[#entries + 1] = {

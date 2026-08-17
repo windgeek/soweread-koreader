@@ -10,12 +10,12 @@
   Lua 1-index 半开；runes[1] ↔ 官方 dataPos 0
   text_to_html[i] = 第 i 个可见字符对应的 HTML rune 下标
 
-@module soweread.annotations.posmap
+@module soweread.textmap.posmap
 --]]--
 
 local util = require("util")
-local Range = require("soweread.annotations.range")
-local Runes = require("soweread.annotations.runes")
+local Range = require("soweread.textmap.range")
+local Runes = require("soweread.textmap.runes")
 
 local PosMap = {}
 

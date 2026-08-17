@@ -15,7 +15,7 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
-local FaceFactory = require("soweread.thought_face_factory")
+local FaceFactory = require("soweread.face_factory")
 local Skin = require("soweread.reader_skin")
 local Ui = require("soweread.ui_components")
 
