@@ -6,7 +6,7 @@
 
 ## Unreleased
 
-- 暂无。
+- 文档 重写 README，突出项目初衷（越狱 Kindle + KOReader 上的纯粹轻量微信阅读体验），新增英文版 `README.en.md`。
 
 ## 1.0.0 - 2026-08-18
 
