@@ -6,9 +6,10 @@ backoff schedule (RATE_LIMIT_DELAYS = {15,30,60,90}), and a cross-process
 shared cooldown file (Http:_shared_rate_limit/_set_shared_rate_limit).
 That logic is already correct and already exercised by every existing
 download; this module does not reimplement it, it only exposes it to
-callers (ChapterCache, PrefetchManager, RequestScheduler) that need to
-ask "are we currently backed off" without going through a full
-Http:request call, and that may not always have a live Http instance.
+callers that need to ask "are we currently backed off" without going
+through a full Http:request call, and that may not always have a live
+Http instance — currently main.lua's lazy-reading extension check, which
+uses it to skip an extension that would only walk into a live cooldown.
 --]]--
 
 local Backoff = {}

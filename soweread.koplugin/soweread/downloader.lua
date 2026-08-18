@@ -989,6 +989,15 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         range_end_title=opt.range_end_title,
         chapter_count=#chapters, expected_chapter_count=expected_chapter_count,
         catalog_chapter_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
+        -- catalog_chapter_count above counts only the chapters this run was
+        -- asked to build (opt.catalog_chapter_count is set from #selected), so
+        -- for a deliberately limited download it says "3 of 3" for a 500-chapter
+        -- book. These two carry the real catalog instead: the count is kept on
+        -- the record, and the map is consumed by _merge_download_result to store
+        -- the book's full catalog and then stripped, so the catalog is not
+        -- duplicated into every variant row.
+        full_catalog_count=type(opt.full_catalog_map)=="table" and #opt.full_catalog_map or nil,
+        full_catalog_map=type(opt.full_catalog_map)=="table" and U.copy(opt.full_catalog_map) or nil,
         readable_chapter_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_chapter_count=tonumber(opt.restricted_chapter_count) or 0,
         failed_chapter_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
@@ -1647,6 +1656,15 @@ function Downloader:book(input, opt, progress)
         cache.manifest.annotation_pending=opt.annotation_pending==true or nil
         cache.manifest.annotation_error_kind=opt.annotation_error_kind
         cache.manifest.annotation_errors=U.copy(opt.annotation_errors or {})
+        cache_save(cache)
+    elseif opt.keep_partial_cache==true then
+        -- Lazy reading grows one book by re-running this download with a larger
+        -- opt.limit. process_one() reuses any chapter already present in the
+        -- checkpoint manifest without touching the network, so keeping the
+        -- checkpoint after a successful build is what makes each extension cost
+        -- only the newly added chapters instead of re-fetching from chapter 1.
+        -- Discarding it here (the normal case, for a download the user asked to
+        -- finish) would make extension O(n^2) in requests.
         cache_save(cache)
     else
         U.remove_tree(cache.root)

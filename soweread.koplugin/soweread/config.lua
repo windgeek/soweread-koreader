@@ -1,6 +1,6 @@
 local C = {
     NAME = "轻松读 · 微信读书助手",
-    VERSION = "1.0.1",
+    VERSION = "1.0.2",
     SCHEMA = 112,
     PLUGIN_DIR = "soweread.koplugin",
     DATA_DIR = "soweread",
@@ -111,26 +111,27 @@ local C = {
     READ_REPORT_AUTH_RETRY_DELAYS = {120, 300, 900, 1800},
     READ_REPORT_CONTEXT_RETRY_DELAYS = {60, 120, 300, 900},
 
-    -- Lazy chapter loading: tap-to-read fetches only the current chapter
-    -- (reusing the standalone-chapter build path), never the whole book.
-    -- min_request_interval/jitter govern READ/METADATA-priority requests
-    -- issued outside the existing download subprocess (which already paces
-    -- itself via Http's shared pacing/backoff). max_concurrency is fixed at
-    -- 1 and is not meant to ever be raised — see ARCHITECTURE_ANALYSIS.md.
-    NETWORK = {
-        min_request_interval = 2.5,
-        jitter = 0.5,
-        max_concurrency = 1,
-    },
-
-    -- Sliding cache window around the current reading position. "previous"/
-    -- "current"/"next" are chapter counts, not bytes. Prefetch only ever
-    -- targets exactly one chapter ahead, never recursively.
-    PREFETCH = {
-        trigger_percent = 0.75,
-        window_previous = 1,
-        window_current = 1,
-        window_next = 1,
+    -- Lazy reading. Tapping a never-opened book downloads FIRST_OPEN_CHAPTERS
+    -- chapters and reads immediately instead of fetching the whole book; while
+    -- reading, EXTEND grows that same EPUB a chunk at a time.
+    --
+    -- FIRST_OPEN_CHAPTERS is a trade-off, not a free parameter: 1 opens the
+    -- fastest but leaves the least to read before the book has to grow, and a
+    -- rebuilt EPUB can only be installed once the reader closes the file (see
+    -- downloader.lua's defer_install), so opening with a little room avoids
+    -- hitting that boundary immediately.
+    FIRST_OPEN_CHAPTERS = 3,
+    EXTEND = {
+        -- Grow once the reader is this far through the installed chapters.
+        trigger_ratio = 0.5,
+        -- Chapters added per extension.
+        chunk = 10,
+        -- Floor between two extension attempts for one book, in seconds.
+        min_interval = 45,
+        -- Release the single in-flight slot after this long even without a
+        -- completion callback, so a lost or never-delivered callback cannot
+        -- wedge extension for the rest of the session.
+        stale_after = 300,
     },
 }
 return C

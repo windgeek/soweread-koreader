@@ -1,8 +1,7 @@
 --[[--
-Explicit network state for the new lazy-chapter subsystems
-(ChapterProvider, PrefetchManager, RequestScheduler).
+Explicit network state for lazy reading (see reader/book_extender.lua).
 
-This is scoped to the NEW subsystems only. It does not replace or touch
+This is scoped to the lazy-reading path only. It does not replace or touch
 sync.lua's own state string or download_task.lua's pause-reason flags —
 those already work and are left alone (see ARCHITECTURE_ANALYSIS.md).
 This exists because the new subsystems would otherwise need their own
