@@ -1,23 +1,34 @@
-MiuRead / WeRead Assistant
+SoweRead / 轻松读 · WeRead Assistant
+Copyright (C) 2026 SoweRead contributors
+
+SoweRead originated as a fork of MiuRead (觅阅), which itself originated
+as a modified version of WeRead KOReader Plugin v0.1.1. Development of
+this modified work began in 2026, and the project has since undergone
+substantial restructuring, modification, and extension, including the
+removal of MiuRead's annotation/highlight sync, thoughts/comments,
+WeChat official-account (MP) article reading, and full-text search
+features, and a redesigned lazy chapter-loading and network-scheduling
+architecture.
+
+Immediate upstream project:
+MiuRead (觅阅 · 微信读书助手)
+https://github.com/miumiupy98-art/miuread-koreader
 Copyright (C) 2026 MiuRead contributors
 
-MiuRead originated as a modified version of WeRead KOReader Plugin v0.1.1.
-Development of this modified work began in 2026, and the project has since
-undergone substantial restructuring, modification, and extension.
-
-Upstream project:
+Original upstream project:
 WeRead KOReader Plugin
 https://github.com/finlater/weread.koplugin
 Copyright (C) finlater and contributors
 
-Copyright in code originating from the upstream project remains with its
-original copyright holders. Copyright in later additions and modifications
-belongs to the respective MiuRead contributors.
+Copyright in code originating from either upstream project remains with
+its original copyright holders. Copyright in later additions and
+modifications belongs to the respective contributors of each project in
+the chain.
 
 This project is distributed under the GNU Affero General Public License
 version 3 only (AGPL-3.0-only). See LICENSE for the complete license text.
 
-MiuRead is an unofficial community project. It is not affiliated with,
+SoweRead is an unofficial community project. It is not affiliated with,
 endorsed by, or sponsored by WeRead, Tencent, KOReader, or the upstream
 project maintainers. All product names and trademarks belong to their
 respective owners.
