@@ -71,6 +71,12 @@ local ReaderTransitionGuard=require("soweread.reader_transition_guard")
 local PluginMenu=require("soweread.plugin_menu")
 local PluginSettings=require("soweread.plugin_settings")
 local Actions=require("soweread.actions")
+local ChapterCache=require("soweread.cache.chapter_cache")
+local ChapterProvider=require("soweread.reader.chapter_provider")
+local PrefetchManager=require("soweread.reader.prefetch_manager")
+local NetworkState=require("soweread.network.network_state")
+local RequestScheduler=require("soweread.network.request_scheduler")
+local Backoff=require("soweread.network.backoff")
 local function gesture_aware_class(base, attributes)
     local class=base:extend(attributes or {})
     function class:handleEvent(event)
@@ -591,6 +597,10 @@ function Plugin:init()
     self.download_task=DownloadTask:new(self.store)
     self.cache_cleanup_task=CacheCleanupTask:new(self.store)
     self.library=Library:new(self.api,self.http,self.store)
+    self.chapter_cache=ChapterCache:new(self.store)
+    self.chapter_provider=ChapterProvider:new(self.store,self.chapter_cache)
+    self.prefetch_manager=PrefetchManager:new(self.store,self.chapter_cache,Config.PREFETCH)
+    self.network_state=NetworkState:new()
     local cover_quality_version=tonumber(self.store:get("cover_quality_version",0)) or 0
     if cover_quality_version<2 then
         local cleared,clear_error=pcall(self.library.clear_covers,self.library)
@@ -993,6 +1003,131 @@ function Plugin:_request_catalog(book,label,on_ready,options)
         status_text=options.status_text or "正在后台读取章节目录…",
         status_seconds=2,
     })
+end
+
+-- Lazy chapter loading: fetch exactly one chapter as a standalone
+-- mini-EPUB, reusing the existing Downloader:book(book,{chapter_uid=uid})
+-- path (see soweread/reader/chapter_provider.lua for why). Modeled
+-- directly on _request_catalog above, with one difference: Downloader:book
+-- needs a fully-functional Store (book_dir/epub_path/save_chapter_variant/
+-- save_book/etc.), not the lightweight interactive_child_store used for a
+-- plain catalog read, so this builds a real isolated Store the same way
+-- download_task.lua's subprocess does for full downloads — a throwaway
+-- copy of the real settings file that is discarded afterward, never
+-- merged back. The lazy chapter cache deliberately does not live in
+-- store.lua's variants map (see chapter_cache.lua), so nothing needs
+-- merging back: the built EPUB file itself lands in the real, shared
+-- books directory regardless of which settings-file copy wrote it, and
+-- the main process (with its own live store) records it in
+-- self.chapter_cache once the subprocess returns the file path.
+-- `uid == nil` means "this book has never been opened, no catalog is
+-- cached yet, fetch just the first chapter" (opt.limit=1 — the normal
+-- "clean" full-book variant, limited to 1 chapter by download_plan.lua's
+-- Plan.select, NOT the standalone chapter_uid path, since we don't have a
+-- uid to pass yet). This deliberately reuses the exact same variant the
+-- ordinary full-download flow would extend later — no separate concept
+-- needed, and the resulting catalog gets cached in store.lua as a side
+-- effect, which is what makes chapter_uid-based lazy fetches for chapter
+-- 2 onward possible without a second catalog round-trip.
+function Plugin:_request_chapter(book,uid,on_ready,options)
+    options=type(options)=="table" and options or {}
+    local id=tostring(book and (book.bookId or book.book_id) or "")
+    if id=="" then return false,"missing book id" end
+    uid=uid~=nil and tostring(uid) or nil
+    local priority=tostring(options.priority or "READ"):upper()
+    if priority~="READ" and priority~="AUTH" then
+        if not self.network_state:can_prefetch() then
+            return false,"network_state:"..tostring(self.network_state:current())
+        end
+        -- Cheap main-process check before paying the subprocess-fork cost:
+        -- if http.lua's own shared rate-limit cooldown is already active
+        -- (written by any process, including the download subprocess),
+        -- don't bother starting a prefetch that would just hit it anyway.
+        local remaining=Backoff.remaining(self.http)
+        if remaining>0 then
+            self.network_state:enter_rate_limited(remaining)
+            return false,"rate_limited:"..tostring(remaining)
+        end
+    end
+    local book_copy=U.copy(book)
+    local settings_path=self.store.settings_path
+    local data_dir=self.store.data_dir
+    local temp_dir=self.store.temp_dir
+    local stamp=tostring(os.time()).."-"..tostring(math.random(100000,999999))
+    local worker_settings_path=temp_dir.."/chapter-settings-"..stamp..".lua"
+    self.store:flush()
+    local copied,copy_error=U.copy_file(settings_path,worker_settings_path)
+    if not copied then return false,"无法建立临时状态副本："..tostring(copy_error or "未知错误") end
+    local label="chapter:"..priority:lower()
+    local key="chapter:"..id..":"..(uid or "first")
+    local fetch_opt=uid and {chapter_uid=uid} or {limit=1}
+    local started,start_err=self:_run_interactive_network(key,label,function()
+        local StoreChild=require("soweread.store")
+        local HttpChild=require("soweread.http")
+        local ReaderChild=require("soweread.reader")
+        local ApiChild=require("soweread.api")
+        local DownloaderChild=require("soweread.downloader")
+        local child_store=StoreChild:new{settings_path=worker_settings_path,data_dir=data_dir,isolated=true}
+        local child_http=HttpChild:new(child_store)
+        local child_reader=ReaderChild:new(child_http,child_store)
+        local child_api=ApiChild:new(child_http,child_store,child_reader)
+        local child_downloader=DownloaderChild:new(child_reader,child_api,nil,child_store,child_http)
+        local request_ok,record_or_err=pcall(child_downloader.book,child_downloader,book_copy,
+            fetch_opt,function() end)
+        os.remove(worker_settings_path)
+        if not request_ok then
+            return {request_ok=false,error=tostring(record_or_err)}
+        end
+        local chapter_map=type(record_or_err.chapter_map)=="table" and record_or_err.chapter_map or {}
+        local resolved_uid,index=nil,nil
+        if uid then
+            for _,chapter in ipairs(chapter_map) do
+                if tostring(chapter.uid)==uid then resolved_uid,index=uid,chapter.index; break end
+            end
+        elseif chapter_map[1] then
+            resolved_uid,index=tostring(chapter_map[1].uid),chapter_map[1].index
+        end
+        return {request_ok=true,file=record_or_err.file,index=index,uid=resolved_uid}
+    end,function(result)
+        if not result or result.ok~=true then
+            os.remove(worker_settings_path)
+            local message=result and result.error or "章节加载失败"
+            if options.on_error then options.on_error(message)
+            elseif options.silent~=true then self:info(self:_friendly_remote_error(message,"章节加载")) end
+            return
+        end
+        local payload=type(result.value)=="table" and result.value or {}
+        if payload.request_ok~=true then
+            local message=tostring(payload.error or "章节加载失败")
+            if Backoff.is_rate_limited_error(Http,message) then
+                self.network_state:enter_rate_limited(Backoff.remaining(self.http)>0 and Backoff.remaining(self.http) or 30)
+            elseif Backoff.is_network_error(Http,message) then
+                self.network_state:set("OFFLINE","chapter_fetch_network_error")
+            end
+            if options.on_error then options.on_error(message)
+            elseif options.silent~=true then self:info(self:_friendly_remote_error(message,"章节加载")) end
+            return
+        end
+        -- Only record standalone chapter_uid fetches in the lazy cache.
+        -- The uid==nil/limit=1 first-chapter fetch is already tracked as a
+        -- normal store.lua "clean" variant by Downloader:_save itself.
+        if uid and payload.file and U.file_exists(payload.file) then
+            self.chapter_cache:put(id,payload.uid or uid,payload.index,payload.file)
+        end
+        if on_ready then on_ready(payload.file,payload.uid,payload.index) end
+    end,{
+        context=options.context,timeout=tonumber(options.timeout) or 45,silent=options.silent,
+        status_title=options.status_title or "章节",
+        status_text=options.status_text or "正在加载当前章节…",
+        status_seconds=2,
+    })
+    if not started then
+        -- The worker closure above never ran (offline/busy/duplicate/start
+        -- failure), so its own cleanup never fired; remove the temp
+        -- settings copy here instead so it never leaks.
+        os.remove(worker_settings_path)
+    end
+    return started,start_err
 end
 
 function Plugin:_wait_for_network(label,callback,options)
@@ -5994,6 +6129,32 @@ function Plugin:_show_home_book_open_popup(book,anchor)
     return true
 end
 
+-- Tap-to-read quick open: fetch only the first chapter instead of showing
+-- the "下载并阅读" (download whole book) popup. Falls back to that popup
+-- on any failure (offline, access denied, preview-only, etc.) so the user
+-- is never stuck without a path forward. The full-book/range download
+-- flow remains reachable via long-press -> "下载书籍" (_home_hold_book,
+-- main.lua ~L7198) regardless of this path's outcome.
+function Plugin:_home_quick_open_book(book,anchor)
+    local id=tostring(book and (book.bookId or book.book_id) or "")
+    if id=="" then return self:_show_home_book_open_popup(book,anchor) end
+    local target=U.copy(book)
+    local fallback=function() self:_show_home_book_open_popup(book,anchor) end
+    self:_request_chapter(target,nil,function(file)
+        if file and U.file_exists(file) then
+            self:_home_stop_background("opening book (quick open)")
+            self:_open_file_direct(file)
+        else
+            fallback()
+        end
+    end,{
+        priority="READ",
+        status_title=tostring(target.title or "书籍"),
+        status_text="正在加载当前章节…",
+        on_error=fallback,
+    })
+end
+
 function Plugin:_home_open_book(book,anchor)
     if book and (book.local_folder==true or book.kind=="folder") then
         local folder_path=LocalLibrary.normalize(book.folder_path or book.path)
@@ -6014,7 +6175,18 @@ function Plugin:_home_open_book(book,anchor)
         self:_home_stop_background("opening book")
         return self:_open_file_direct(record.file)
     end
-    if id~="" then return self:_show_home_book_open_popup(book,anchor) end
+    if id~="" then
+        -- A failed or partially-completed download already has its own
+        -- resume/repair flow (via the popup's "继续下载/修复" button) —
+        -- quick-open would just start a second, conflicting fetch, so only
+        -- attempt it for a book that has never been touched before.
+        local state=self:_download_state()
+        local has_existing_attempt=(state.status=="failed"
+            and tostring(state.book_id or state.bookId or "")==id)
+            or self.store:book_has_partial_cache(id)==true
+        if not has_existing_attempt then return self:_home_quick_open_book(book,anchor) end
+        return self:_show_home_book_open_popup(book,anchor)
+    end
     self:info("本地书籍记录不存在")
     return false
 end
@@ -16938,6 +17110,64 @@ end
 
 function Plugin:onScreenResize() return self:onSetDimensions() end
 function Plugin:onRotation() return self:onSetDimensions() end
+-- Best-effort chapter-relative position: current page's toc index gives
+-- the chapter's start page; the next toc entry's page (or document end)
+-- gives its end. Wrapped defensively throughout since KOReader's TOC API
+-- shape varies by version and this is a pure optimization — if it can't
+-- be computed, prefetch simply never triggers this turn, which is a safe
+-- no-op, not a correctness bug.
+function Plugin:_reader_chapter_relative_position(page)
+    if not (self.ui and self.ui.toc and self.ui.document) then return nil end
+    local toc=self.ui.toc
+    if type(toc.getTocIndexByPage)~="function" then return nil end
+    local ok_index,toc_index=pcall(toc.getTocIndexByPage,toc,page)
+    if not ok_index or not toc_index or not toc.toc or not toc.toc[toc_index] then return nil end
+    local start_page=tonumber(toc.toc[toc_index].page)
+    if not start_page then return nil end
+    local end_page
+    local next_entry=toc.toc[toc_index+1]
+    if next_entry and tonumber(next_entry.page) then
+        end_page=tonumber(next_entry.page)-1
+    else
+        local ok_total,total=pcall(self.ui.document.getPageCount,self.ui.document)
+        end_page=ok_total and tonumber(total) or page
+    end
+    if not end_page or end_page<start_page then return nil end
+    return page-start_page,math.max(1,end_page-start_page+1)
+end
+
+-- One prefetch decision per idle window, never on the page-turn path
+-- itself (matches _schedule_reader_toolbar_state_refresh's own idle-defer
+-- pattern just above, and the E-Ink "page turns stay free of optional
+-- work" principle documented throughout this codebase).
+function Plugin:_maybe_prefetch_next_chapter(page)
+    local current=self:_current_book_record()
+    if not current or not current.book or not current.record then return end
+    local book_id=tostring(current.book.book_id or "")
+    local catalog=type(current.book.catalog)=="table" and current.book.catalog or nil
+    if book_id=="" or not catalog then return end
+    local local_map=current.record.chapter_map or {}
+    if #local_map==0 then return end
+    local ok_ratio,ratio=pcall(self.sync.local_ratio,self.sync)
+    if not ok_ratio then return end
+    local ok_pos,position=pcall(self.sync.position,self.sync,current,ratio or 0,local_map)
+    local current_uid=ok_pos and position and tostring(position.chapter_uid or "") or nil
+    if not current_uid or current_uid=="" then return end
+    local within,pages_in_chapter=self:_reader_chapter_relative_position(page)
+    if not within then return end
+    local uid,reason=self.prefetch_manager:should_prefetch(
+        book_id,current_uid,within,pages_in_chapter,catalog,self.network_state)
+    if not uid then return end
+    self.prefetch_manager:mark_in_flight(uid)
+    local book={bookId=book_id,title=current.book.title,author=current.book.author,cover=current.book.cover}
+    self:_request_chapter(book,uid,function()
+        self.prefetch_manager:mark_done(uid)
+    end,{
+        priority="PREFETCH",silent=true,
+        on_error=function() self.prefetch_manager:mark_done(uid) end,
+    })
+end
+
 function Plugin:onPageUpdate(page)
     self:_mark_reader_busy(2)
     local cache=self:_reader_toolbar_cache()
@@ -16947,6 +17177,15 @@ function Plugin:onPageUpdate(page)
     -- lookup is delayed until the reader has been idle, keeping the flip path
     -- free of optional work.
     self:_schedule_reader_toolbar_state_refresh(current,.55)
+    if current and not self.prefetch_manager:busy() then
+        local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+        UIManager:scheduleIn(.6,self:safe("prefetch",function()
+            if tonumber(HOME_SESSION.reader_session_generation or 0)==session
+                and self.ui and self.ui.document then
+                self:_maybe_prefetch_next_chapter(current)
+            end
+        end))
+    end
     self.sync:on_page(page)
 end
 function Plugin:onAnnotationsModified()
@@ -16964,6 +17203,11 @@ function Plugin:onSuspend()
     self:_set_foreground("suspended")
     StatusToast.set_blocked(true)
     StatusToast.close()
+    -- _cancel_interactive_network already cancels any in-flight chapter
+    -- quick-open/prefetch (they both run through self.interactive_network_async);
+    -- these two just keep the new subsystems' own state tracking consistent.
+    self.prefetch_manager:on_suspend()
+    self.network_state:enter_suspended()
     self:_cancel_interactive_network("suspend")
     if self._local_annotation_snapshot_task then
         UIManager:unschedule(self._local_annotation_snapshot_task)
@@ -17039,6 +17283,12 @@ function Plugin:onResume()
     self._soweread_suspended=false
     HOME_SESSION.suspended=false
     StatusToast.set_blocked(false)
+    -- Never resume a backlog: this only clears the suspended/blocked state.
+    -- The next onPageUpdate naturally re-evaluates prefetch from scratch,
+    -- matching download_task.lua's own "wake, wait, re-check, resume only
+    -- what's needed" resume discipline rather than resuming anything here.
+    self.prefetch_manager:on_resume()
+    self.network_state:resume()
     local close_pending=reader_close_active()
     local native_menu_pending=NATIVE_MENU_GUARD.active==true
     if close_pending then

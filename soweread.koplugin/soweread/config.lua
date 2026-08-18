@@ -110,5 +110,27 @@ local C = {
     DOWNLOAD_NETWORK_IPV4_MIN_GAIN_SECONDS = 1,
     READ_REPORT_AUTH_RETRY_DELAYS = {120, 300, 900, 1800},
     READ_REPORT_CONTEXT_RETRY_DELAYS = {60, 120, 300, 900},
+
+    -- Lazy chapter loading: tap-to-read fetches only the current chapter
+    -- (reusing the standalone-chapter build path), never the whole book.
+    -- min_request_interval/jitter govern READ/METADATA-priority requests
+    -- issued outside the existing download subprocess (which already paces
+    -- itself via Http's shared pacing/backoff). max_concurrency is fixed at
+    -- 1 and is not meant to ever be raised — see ARCHITECTURE_ANALYSIS.md.
+    NETWORK = {
+        min_request_interval = 2.5,
+        jitter = 0.5,
+        max_concurrency = 1,
+    },
+
+    -- Sliding cache window around the current reading position. "previous"/
+    -- "current"/"next" are chapter counts, not bytes. Prefetch only ever
+    -- targets exactly one chapter ahead, never recursively.
+    PREFETCH = {
+        trigger_percent = 0.75,
+        window_previous = 1,
+        window_current = 1,
+        window_next = 1,
+    },
 }
 return C
