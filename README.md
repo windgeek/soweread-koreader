@@ -39,6 +39,10 @@
 - 创建正式 tag 后，GitHub Actions 自动校验版本、执行 Lua 5.1 语法检查、构建 full.zip、校验 SHA-256 与公开下载地址，并更新固定正式 OTA 清单。
 - tag、`soweread.koplugin/soweread/config.lua` 与 `soweread.koplugin/_meta.lua` 中的版本必须一致。
 
+## 参与贡献
+
+欢迎报 bug、提功能建议、发 PR——详见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。项目定位很明确："只做阅读这一件事"，批注同步、想法评论、公众号文章、全文搜索是刻意移除的功能，不在计划恢复之列；但让核心体验更稳、更快、更省流量的改动非常欢迎。
+
 ## 来源与许可证
 
 轻松读（SoweRead）fork 自 MiuRead（觅阅），而 MiuRead 本身是 `finlater/weread.koplugin` v0.1.1 的修改版本，经过大量重构、修改与扩展后发展而来。

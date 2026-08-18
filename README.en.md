@@ -39,6 +39,10 @@ The stable update manifest is generated automatically by GitHub Actions on relea
 - Pushing a stable tag triggers GitHub Actions to validate the version, run a Lua 5.1 syntax check, build `full.zip`, verify its SHA-256 and public download URL, and update the fixed stable OTA manifest.
 - The tag, the version in `soweread.koplugin/soweread/config.lua`, and the version in `soweread.koplugin/_meta.lua` must all match.
 
+## Contributing
+
+Bug reports, feature suggestions, and PRs are welcome — see [`CONTRIBUTING.en.md`](CONTRIBUTING.en.md). The project's scope is deliberately narrow: "just reading, kept light." Annotation sync, thoughts/comments, official-account articles, and full-text search were cut on purpose and aren't planned to come back — but changes that make the core experience more reliable, faster, or lighter on network usage are very welcome.
+
 ## Origin and license
 
 SoweRead is forked from MiuRead (觅阅), which itself originated as a modified version of `finlater/weread.koplugin` v0.1.1, having undergone substantial restructuring, modification, and extension since.
