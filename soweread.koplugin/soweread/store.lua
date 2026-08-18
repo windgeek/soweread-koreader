@@ -1466,6 +1466,19 @@ function Store:partial_cache_paths(id)
     return out
 end
 function Store:book_has_partial_cache(id) return #self:partial_cache_paths(id)>0 end
+-- Lazy single-chapter fetches (prefetch and tap-to-read of a specific chapter)
+-- use option_key "…-chapter-<uid>" and leave a partial directory behind if they
+-- are interrupted. Those are throwaway cache artifacts, not an interrupted
+-- book download the user should be offered a resume/repair flow for — treating
+-- them as one made a single failed prefetch disqualify the book from
+-- tap-to-read permanently. Callers deciding "has this book a real download
+-- attempt in progress" want this variant, not book_has_partial_cache.
+function Store:book_has_partial_download_cache(id)
+    for _,path in ipairs(self:partial_cache_paths(id)) do
+        if not tostring(path):match("%-chapter%-[^/]*$") then return true end
+    end
+    return false
+end
 function Store:variant_paths(id,kind)
     local r=self:variant(id,kind)
     return r and r.file and {r.file} or {}

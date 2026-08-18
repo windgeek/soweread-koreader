@@ -1579,6 +1579,17 @@ function Plugin:on_auth_success(name)
     local detail=tostring(name or "微信读书账号")
         ..(resumed and " · 正在恢复后台任务" or (web_ready and "" or " · 在线功能将在实际使用时验证"))
     self:status_toast(title,detail,5)
+    -- The home surface behind the login flow was built while logged out, so it
+    -- keeps rendering the signed-out header and an empty WeRead shelf until
+    -- KOReader is restarted. Auth exists now: pull the shelf and rebuild the
+    -- view so logging in takes effect in place.
+    if not self._reader_context then
+        UIManager:scheduleIn(.6,function()
+            if not self:logged_in() or self:_active_reader_ui() then return end
+            self:_refresh_home_view(nil,"header")
+            self:_home_refresh_remote(true,false)
+        end)
+    end
 end
 function Plugin:_download_menu_text()
     if self:_has_download_status() then
@@ -2758,6 +2769,14 @@ end
 
 function Plugin:_mode_intro_needed()
     if self._reader_context then return false end
+    -- FileManager and ReaderUI build separate plugin instances, each with its
+    -- own Store. Returning to the file manager after reading constructs a fresh
+    -- instance whose init() re-runs this check, and it can read preferences that
+    -- predate another instance's acknowledgement — which showed the intro a
+    -- second time after the user had already confirmed it. The guidance is
+    -- meant to appear once per launch, so gate it on the shared session table
+    -- as well as on the persisted flag.
+    if HOME_SESSION.mode_intro_acked==true then return false end
     if not self:_notice_enabled("mode_environment") then return false end
     local pending=self:_mode_intro_pending_mode()
     local runtime=self:_home_enabled() and "desktop" or "plugin"
@@ -2786,6 +2805,7 @@ function Plugin:_clear_mode_intro_pending()
 end
 
 function Plugin:_ack_mode_intro()
+    HOME_SESSION.mode_intro_acked=true
     local intro,preferences=self:_mode_intro_preferences()
     intro.last_confirmed_mode=self:_home_enabled() and "desktop" or "plugin"
     intro.confirmed_at=os.time()
@@ -6139,20 +6159,49 @@ function Plugin:_home_quick_open_book(book,anchor)
     local id=tostring(book and (book.bookId or book.book_id) or "")
     if id=="" then return self:_show_home_book_open_popup(book,anchor) end
     local target=U.copy(book)
-    local fallback=function() self:_show_home_book_open_popup(book,anchor) end
-    self:_request_chapter(target,nil,function(file)
+    -- Fetching a chapter can take tens of seconds on a slow connection. A 2s
+    -- status toast leaves the screen unchanged for the rest of that wait, which
+    -- on e-ink reads as a frozen device, so hold a real indicator for the whole
+    -- request and take it down on every exit path below.
+    local loading=InfoMessage:new{text="正在加载《"..tostring(target.title or "书籍").."》当前章节…"}
+    UIManager:show(loading)
+    local settled=false
+    local function dismiss()
+        if loading then pcall(function() UIManager:close(loading) end); loading=nil end
+    end
+    local function fallback()
+        if settled then return end
+        settled=true
+        dismiss()
+        self:_show_home_book_open_popup(book,anchor)
+    end
+    local started,start_err=self:_request_chapter(target,nil,function(file)
+        if settled then return end
         if file and U.file_exists(file) then
+            settled=true
+            dismiss()
             self:_home_stop_background("opening book (quick open)")
             self:_open_file_direct(file)
         else
             fallback()
         end
-    end,{
-        priority="READ",
-        status_title=tostring(target.title or "书籍"),
-        status_text="正在加载当前章节…",
-        on_error=fallback,
-    })
+    end,{priority="READ",silent=true,on_error=fallback})
+    if started then return true end
+    -- _request_chapter refused before the worker ever started (offline, busy
+    -- with another interactive request, temp-copy failure, ...). No callback
+    -- will ever fire, so this tap has to resolve here — otherwise the book
+    -- simply does not respond to being tapped, which is what a refusal used to
+    -- look like on device.
+    if tostring(start_err or "")=="duplicate request" then
+        -- The identical fetch is genuinely still running and owns its own
+        -- indicator; it will open the book when it lands.
+        settled=true
+        dismiss()
+        self:toast("正在加载该书当前章节，请稍候…",2)
+        return false
+    end
+    fallback()
+    return false
 end
 
 function Plugin:_home_open_book(book,anchor)
@@ -6183,7 +6232,7 @@ function Plugin:_home_open_book(book,anchor)
         local state=self:_download_state()
         local has_existing_attempt=(state.status=="failed"
             and tostring(state.book_id or state.bookId or "")==id)
-            or self.store:book_has_partial_cache(id)==true
+            or self.store:book_has_partial_download_cache(id)==true
         if not has_existing_attempt then return self:_home_quick_open_book(book,anchor) end
         return self:_show_home_book_open_popup(book,anchor)
     end
@@ -17160,12 +17209,19 @@ function Plugin:_maybe_prefetch_next_chapter(page)
     if not uid then return end
     self.prefetch_manager:mark_in_flight(uid)
     local book={bookId=book_id,title=current.book.title,author=current.book.author,cover=current.book.cover}
-    self:_request_chapter(book,uid,function()
+    local started=self:_request_chapter(book,uid,function()
         self.prefetch_manager:mark_done(uid)
     end,{
         priority="PREFETCH",silent=true,
         on_error=function() self.prefetch_manager:mark_done(uid) end,
     })
+    -- A PREFETCH request is refused synchronously whenever the network state
+    -- disallows it, a shared cooldown is still counting down, or an interactive
+    -- request holds the worker — all routine. Neither callback runs in that
+    -- case, so release the single in-flight slot here; leaving it held would
+    -- make should_prefetch() bail forever and silently kill prefetching for the
+    -- rest of the reading session.
+    if not started then self.prefetch_manager:mark_done(uid) end
 end
 
 function Plugin:onPageUpdate(page)

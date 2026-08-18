@@ -1,6 +1,6 @@
 local C = {
     NAME = "轻松读 · 微信读书助手",
-    VERSION = "1.0.0",
+    VERSION = "1.0.1",
     SCHEMA = 112,
     PLUGIN_DIR = "soweread.koplugin",
     DATA_DIR = "soweread",
